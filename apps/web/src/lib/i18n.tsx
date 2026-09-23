@@ -463,6 +463,7 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
         return t.status[status as keyof typeof t.status] || status
       },
       stageLabel: (name, fallback) => {
+        if (name === "tts" && fallback === "IndexTTS") return "IndexTTS"
         if (name && name in t.stages) return t.stages[name as keyof typeof t.stages]
         if (fallback && fallback in t.stages) return t.stages[fallback as keyof typeof t.stages]
         return fallback || name || t.common.waiting

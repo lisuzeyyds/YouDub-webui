@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -536,19 +537,31 @@ class PipelineRunner:
         self.stage_message("split_audio", "Created vocal reference segments")
 
     def _tts(self, _: dict) -> None:
-        from .adapters.voxcpm import generate_tts
-
         session = _require(self.artifacts.session, "session")
         translation_file = _require(self.artifacts.translation_file, "translation_file")
         vocals_dir = _require(self.artifacts.vocals_dir, "vocals_dir")
         vocals_file = _require(self.artifacts.vocals_file, "vocals_file")
-        self.artifacts.tts_dir = generate_tts(
-            translation_file,
-            vocals_dir,
-            session,
-            progress_callback=lambda progress, message: self.stage_progress("tts", progress, message),
-            original_vocals_file=vocals_file,
-        )
+        progress = lambda progress, message: self.stage_progress("tts", progress, message)
+        backend = "indextts" if (os.getenv("INDEXTTS_API_URL") or "").strip() else "voxcpm"
+        if backend == "indextts":
+            from .adapters.indextts_api import generate_tts as indextts_generate
+
+            self.artifacts.tts_dir = indextts_generate(
+                translation_file,
+                vocals_dir,
+                session,
+                progress_callback=progress,
+            )
+        else:
+            from .adapters.voxcpm import generate_tts as voxcpm_generate
+
+            self.artifacts.tts_dir = voxcpm_generate(
+                translation_file,
+                vocals_dir,
+                session,
+                progress_callback=progress,
+                original_vocals_file=vocals_file,
+            )
         wav_count = len(list(self.artifacts.tts_dir.glob("*.wav")))
         self.stage_message("tts", f"Generated {wav_count} TTS clips -> {self.artifacts.tts_dir}")
 

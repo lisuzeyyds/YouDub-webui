@@ -16,7 +16,7 @@ from .config import (
     openai_defaults,
     ytdlp_defaults,
 )
-from .stages import STAGES
+from .stages import STAGES, stage_label
 
 
 ACTIVE_STATUSES = ("queued", "running")
@@ -356,7 +356,7 @@ def create_task(
             INSERT INTO task_stages (task_id, name, label, status)
             VALUES (?, ?, ?, 'pending')
             """,
-            [(new_id, stage.name, stage.label) for stage in STAGES],
+            [(new_id, stage.name, stage_label(stage)) for stage in STAGES],
         )
     return new_id
 
@@ -391,7 +391,7 @@ def create_or_get_video_task(
                 INSERT INTO task_stages (task_id, name, label, status)
                 VALUES (?, ?, ?, 'pending')
                 """,
-                [(task_id, stage.name, stage.label) for stage in STAGES],
+                [(task_id, stage.name, stage_label(stage)) for stage in STAGES],
             )
             return task_id, True
 
