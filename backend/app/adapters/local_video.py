@@ -60,7 +60,8 @@ def _session_path(workfolder: Path, task_id: str, title: str) -> Path:
 
 
 def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
-    subprocess.run(
+    # DEBUG: capture ffmpeg output to diagnose silent exit-1 failures
+    result = subprocess.run(
         [
             ffmpeg_binary(),
             "-y",
@@ -82,8 +83,22 @@ def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
             "+faststart",
             str(video_file),
         ],
-        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+    if result.returncode != 0:
+        debug_path = Path("data/tmp/ffmpeg_debug.log")
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(debug_path, "a", encoding="utf-8") as handle:
+            handle.write(f"=== rc={result.returncode} cwd={Path.cwd()} ===\n")
+            handle.write((result.stderr or "")[-4000:])
+            handle.write("\n")
+        raise RuntimeError(
+            f"ffmpeg failed with exit code {result.returncode}: "
+            f"{(result.stderr or '').strip().splitlines()[-1] if (result.stderr or '').strip() else '(no stderr)'}"
+        )
 
 
 def import_local_video(url: str, workfolder: Path, source: SourceConfig) -> tuple[Path, dict]:
