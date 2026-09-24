@@ -9,6 +9,12 @@ function apiProxyTarget() {
 
 const nextConfig: NextConfig = {
   allowedDevOrigins: ["172.27.2.90", "100.94.222.54"],
+  experimental: {
+    // 大视频上传走 rewrites 代理时，默认 30s 超时 + 10MB 请求体截断
+    // 这里与后端 LOCAL_UPLOAD_MAX_BYTES (4GB) 对齐
+    proxyTimeout: 30 * 60 * 1000,
+    proxyClientMaxBodySize: "5gb",
+  },
   async rewrites() {
     return [
       {
