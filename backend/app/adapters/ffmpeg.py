@@ -9,6 +9,30 @@ from pathlib import Path
 from ..audio_mode import target_text
 from ..config import ffmpeg_binary, ffprobe_binary
 
+
+def _run_ffmpeg(command: list[str], cwd: Path | None = None) -> None:
+    """Run ffmpeg with piped stdio.
+
+    ffmpeg spawned with inherited stdio handles from a background service
+    worker on Windows exits immediately with code 1 and no output. Piping
+    the streams makes it run reliably and lets us surface the real error.
+    """
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg failed (exit {}): {}".format(
+                result.returncode,
+                (result.stderr or "").strip().splitlines()[-1:] or ["no output"],
+            )
+        )
+
 SUBTITLE_PUNCTUATION = {"，", ",", "；", ";", "：", ":", "。", "?", "？", "!", "！", "、"}
 SUBTITLE_PROTECTED_PAIRS = {"《": "》", "（": "）", "【": "】", "「": "」", "『": "』"}
 SUBTITLE_CLOSING_QUOTES = {'"', "'", "」", "』", "》", "）", "】", "\u201d", "\u2019", "]"}
@@ -279,7 +303,7 @@ def merge_video(
         dubbing_input = dubbing_file.resolve()
         bgm_input = bgm_file.resolve()
         mixed_audio_output = (tmp_dir / "audio_mixed.m4a").resolve()
-        subprocess.run(
+        _run_ffmpeg(
             [
                 ffmpeg_binary(),
                 "-y",
@@ -295,7 +319,6 @@ def merge_video(
                 "aac",
                 str(mixed_audio_output),
             ],
-            check=True,
         )
 
     temporary_video = media_dir / f".video_final.{uuid.uuid4().hex}.mp4"
@@ -317,7 +340,7 @@ def merge_video(
         if mixed_audio_output is not None:
             command.append("-shortest")
         command.append(str(temporary_video.resolve()))
-        subprocess.run(command, check=True, cwd=session_dir)
+        _run_ffmpeg(command, cwd=session_dir)
         temporary_video.replace(final_video)
         return final_video
     except Exception:

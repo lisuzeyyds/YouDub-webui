@@ -11,6 +11,7 @@ import soundfile as sf
 
 from ..config import REPO_ROOT, ffmpeg_binary, ffprobe_binary
 from ..devices import resolve_device
+from .ffmpeg import _run_ffmpeg
 
 
 SHIFTS = 3
@@ -128,7 +129,7 @@ def _extract_audio(
     pan = "pan=stereo|c0=c0|c1=c0" if source_channels == 1 else "pan=stereo|c0=c0|c1=c1"
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.unlink(missing_ok=True)
-    subprocess.run(
+    _run_ffmpeg(
         [
             ffmpeg_binary(),
             "-y",
@@ -149,7 +150,6 @@ def _extract_audio(
             "auto",
             str(destination),
         ],
-        check=True,
     )
     if not destination.exists() or destination.stat().st_size == 0:
         raise RuntimeError(f"FFmpeg produced no audio for separation: {video_file}")
