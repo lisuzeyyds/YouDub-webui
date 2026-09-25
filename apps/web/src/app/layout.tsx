@@ -28,6 +28,9 @@ export default function RootLayout({
     <html
       lang="zh-CN"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      // 浏览器插件（如沉浸式翻译）会在 hydration 前往 <html> 注入属性，
+      // 导致无害的 hydration mismatch 警告，这里显式忽略。
+      suppressHydrationWarning
     >
       <body className="min-h-full flex flex-col">
         <LanguageProvider>
