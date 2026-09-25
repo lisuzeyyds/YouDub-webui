@@ -11,11 +11,13 @@ from ..config import ffmpeg_binary, ffprobe_binary
 
 
 def _run_ffmpeg(command: list[str], cwd: Path | None = None) -> None:
-    """Run ffmpeg with piped stdio.
+    """Run ffmpeg with piped stdio and a detached stdin.
 
     ffmpeg spawned with inherited stdio handles from a background service
     worker on Windows exits immediately with code 1 and no output. Piping
     the streams makes it run reliably and lets us surface the real error.
+    stdin is set to DEVNULL as well: the worker's own stdin can be a stale
+    console/pipe handle, and ffmpeg reads stdin for interactive keys.
     """
     result = subprocess.run(
         command,
@@ -24,6 +26,7 @@ def _run_ffmpeg(command: list[str], cwd: Path | None = None) -> None:
         encoding="utf-8",
         errors="replace",
         cwd=cwd,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         raise RuntimeError(

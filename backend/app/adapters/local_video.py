@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import glob
 import json
+import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -59,16 +62,64 @@ def _session_path(workfolder: Path, task_id: str, title: str) -> Path:
     return workfolder / "local" / f"{safe_title}__{task_id}"
 
 
+def _debug_log(text: str) -> None:
+    try:
+        debug_path = Path("data/tmp/ffmpeg_debug.log")
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(debug_path, "a", encoding="utf-8") as handle:
+            handle.write(text if text.endswith("\n") else text + "\n")
+    except OSError:
+        pass
+
+
+def _ffmpeg_environment_report(binary: str) -> str:
+    """Collect what the worker process actually sees when it spawns ffmpeg."""
+    lines = [
+        f"=== probe @{time.strftime('%Y-%m-%dT%H:%M:%S')} ===",
+        f"cwd={Path.cwd()}",
+        f"argv0={binary!r}",
+        f"which={shutil.which(binary)!r}",
+        f"PATH={os.environ.get('PATH', '')}",
+    ]
+    for label, extra in (("plain", []), ("nostdin", ["-nostdin"]), ("devnull-stdin", [])):
+        cmd = [binary, *extra, "-version"]
+        kwargs = {"stdin": subprocess.DEVNULL} if label == "devnull-stdin" else {}
+        try:
+            probe = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                **kwargs,
+            )
+            first = [ln for ln in (probe.stderr or probe.stdout or "").splitlines() if ln.strip()]
+            lines.append(
+                f"probe[{label}] rc={probe.returncode} "
+                f"first={first[0][:120] if first else '(EMPTY)'} "
+                f"stderr_len={len(probe.stderr or '')}"
+            )
+        except BaseException as exc:  # noqa: BLE001
+            lines.append(f"probe[{label}] EXC {type(exc).__name__}: {str(exc)[:160]}")
+    lines.append(f"sibling_ffmpegs={glob.glob(str(Path(binary).parent / 'ffmpeg*')) if os.sep in binary else '(bare name)'}")
+    return "\n".join(lines)
+
+
 def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
-    # ffmpeg can fail spuriously mid-encode on Windows (shared-build crash
-    # with exit 1 and no stderr output). Retry once before giving up; the
-    # full stderr of the last attempt is kept in data/tmp/ffmpeg_debug.log.
-    attempts = 2
+    # ffmpeg can fail spuriously on Windows with exit 1 and no stderr output
+    # (process dies before it can even print its banner). Retry a few times
+    # with a short backoff and keep diagnostics in data/tmp/ffmpeg_debug.log.
+    binary = ffmpeg_binary()
+    attempts = 3
     result = None
+    last_error = ""
     for attempt in range(1, attempts + 1):
+        started = time.time()
         result = subprocess.run(
             [
-                ffmpeg_binary(),
+                binary,
+                "-nostdin",
                 "-y",
                 "-i",
                 str(source_file),
@@ -92,21 +143,25 @@ def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            stdin=subprocess.DEVNULL,
         )
+        elapsed = time.time() - started
         if result.returncode == 0:
             return
+        last_error = (
+            f"attempt {attempt}/{attempts}: rc={result.returncode} elapsed={elapsed:.2f}s "
+            f"stderr_len={len(result.stderr or '')}"
+        )
+        _debug_log(last_error + "\n" + (result.stderr or "")[-4000:])
         if attempt < attempts:
             video_file.unlink(missing_ok=True)
+            time.sleep(5)
     if result is not None and result.returncode != 0:
-        debug_path = Path("data/tmp/ffmpeg_debug.log")
-        debug_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(debug_path, "a", encoding="utf-8") as handle:
-            handle.write(f"=== rc={result.returncode} cwd={Path.cwd()} ===\n")
-            handle.write((result.stderr or "")[-4000:])
-            handle.write("\n")
+        _debug_log(_ffmpeg_environment_report(binary))
         raise RuntimeError(
             f"ffmpeg failed with exit code {result.returncode}: "
             f"{(result.stderr or '').strip().splitlines()[-1] if (result.stderr or '').strip() else '(no stderr)'}"
+            f" [{last_error}]"
         )
 
 
