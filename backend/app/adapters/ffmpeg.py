@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -11,24 +12,44 @@ from ..config import ffmpeg_binary, ffprobe_binary
 
 
 def _run_ffmpeg(command: list[str], cwd: Path | None = None) -> None:
-    """Run ffmpeg with piped stdio and a detached stdin.
+    """Run ffmpeg with piped stdio, a detached stdin, and one retry.
 
     ffmpeg spawned with inherited stdio handles from a background service
     worker on Windows exits immediately with code 1 and no output. Piping
     the streams makes it run reliably and lets us surface the real error.
     stdin is set to DEVNULL as well: the worker's own stdin can be a stale
     console/pipe handle, and ffmpeg reads stdin for interactive keys.
+    A silent exit (rc != 0 with empty stderr) is retried once, as it has
+    been observed to clear on its own.
     """
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-    )
-    if result.returncode != 0:
+    attempts = 2
+    result = None
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            return
+        if attempt < attempts:
+            try:
+                debug_path = Path("data/tmp/ffmpeg_debug.log")
+                debug_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(debug_path, "a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"=== _run_ffmpeg retry: rc={result.returncode} "
+                        f"stderr_len={len(result.stderr or '')} cmd={command[:3]} ===\n"
+                    )
+                    handle.write((result.stderr or "")[-2000:] + "\n")
+            except OSError:
+                pass
+            time.sleep(5)
+    if result is not None and result.returncode != 0:
         raise RuntimeError(
             "ffmpeg failed (exit {}): {}".format(
                 result.returncode,
