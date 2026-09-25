@@ -60,35 +60,44 @@ def _session_path(workfolder: Path, task_id: str, title: str) -> Path:
 
 
 def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
-    # DEBUG: capture ffmpeg output to diagnose silent exit-1 failures
-    result = subprocess.run(
-        [
-            ffmpeg_binary(),
-            "-y",
-            "-i",
-            str(source_file),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            str(video_file),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
+    # ffmpeg can fail spuriously mid-encode on Windows (shared-build crash
+    # with exit 1 and no stderr output). Retry once before giving up; the
+    # full stderr of the last attempt is kept in data/tmp/ffmpeg_debug.log.
+    attempts = 2
+    result = None
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(
+            [
+                ffmpeg_binary(),
+                "-y",
+                "-i",
+                str(source_file),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                str(video_file),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode == 0:
+            return
+        if attempt < attempts:
+            video_file.unlink(missing_ok=True)
+    if result is not None and result.returncode != 0:
         debug_path = Path("data/tmp/ffmpeg_debug.log")
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         with open(debug_path, "a", encoding="utf-8") as handle:
