@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,35 @@ from .runtime_checks import validate_runtime_device
 from .sources import detect_source
 from .stages import STAGES
 from .youtube import is_local_upload_url
+
+
+def _stage_attempts() -> int:
+    """How many times a stage may be attempted (default 3)."""
+    raw = os.getenv("YOUDUB_STAGE_ATTEMPTS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return 3
+
+
+def _stage_retry_delay() -> int:
+    """Seconds to wait between stage attempts (default 20)."""
+    raw = os.getenv("YOUDUB_STAGE_RETRY_DELAY", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return 20
+
+
+def _is_transient_stage_error(exc: BaseException) -> bool:
+    """Whether a stage failure is worth retrying.
+
+    Child processes on this host are occasionally killed by the surrounding
+    sandbox job (exit code 1, no stderr), which clears on its own - those are
+    RuntimeError/OSError. Deterministic failures (bad input, missing file,
+    invalid mode) are not retried so a genuinely broken task fails fast.
+    """
+    if isinstance(exc, (ValueError, FileNotFoundError, KeyError, AssertionError, ImportError)):
+        return False
+    return isinstance(exc, (RuntimeError, OSError, subprocess.SubprocessError))
 
 
 logger = logging.getLogger(__name__)
@@ -237,6 +268,29 @@ class PipelineRunner:
 
     def _run_stage(self, stage: str) -> None:
         self._progress_state.pop(stage, None)
+        attempts = _stage_attempts()
+        delay = _stage_retry_delay()
+        for attempt in range(1, attempts + 1):
+            try:
+                self._attempt_stage(stage, attempt, attempts)
+                return
+            except Exception as stage_exc:  # noqa: BLE001
+                if _is_transient_stage_error(stage_exc) and attempt < attempts:
+                    self.stage_message(
+                        stage,
+                        f"Attempt {attempt}/{attempts} failed ({stage_exc}); "
+                        f"retrying in {delay}s",
+                    )
+                    self.log(
+                        f"[{stage}] transient failure on attempt {attempt}/{attempts}: "
+                        f"{stage_exc} - retrying in {delay}s"
+                    )
+                    time.sleep(delay)
+                    self._progress_state.pop(stage, None)
+                    continue
+                raise
+
+    def _attempt_stage(self, stage: str, attempt: int = 1, attempts: int = 1) -> None:
         database.update_task(self.task_id, current_stage=stage)
         database.update_stage(
             self.task_id,
@@ -247,7 +301,7 @@ class PipelineRunner:
             completed_at=None,
             error_message=None,
         )
-        self.stage_message(stage, "Started")
+        self.stage_message(stage, "Started" if attempt == 1 else f"Retry {attempt}/{attempts}")
         try:
             self._stage_handlers[stage](database.get_task(self.task_id))
         except Exception as stage_exc:

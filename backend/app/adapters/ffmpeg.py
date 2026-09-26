@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -9,6 +10,11 @@ from pathlib import Path
 
 from ..audio_mode import target_text
 from ..config import ffmpeg_binary, ffprobe_binary
+
+# Windows: never allocate a console for ffmpeg. Console allocation is a known
+# failure source for children spawned from a console-less service worker (and
+# it would otherwise create stray console windows).
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 def _run_ffmpeg(command: list[str], cwd: Path | None = None) -> None:
@@ -33,6 +39,7 @@ def _run_ffmpeg(command: list[str], cwd: Path | None = None) -> None:
             errors="replace",
             cwd=cwd,
             stdin=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW,
         )
         if result.returncode == 0:
             return

@@ -14,6 +14,8 @@ from ..sanitize import sanitize_text
 from ..sources import SourceConfig
 from ..youtube import local_upload_task_id
 
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 
 def upload_dir(workfolder: Path, task_id: str) -> Path:
     return workfolder / "_uploads" / task_id
@@ -108,13 +110,18 @@ def _ffmpeg_environment_report(binary: str) -> str:
 
 def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
     # ffmpeg can fail spuriously on Windows with exit 1 and no stderr output
-    # (process dies before it can even print its banner). Retry a few times
-    # with a short backoff and keep diagnostics in data/tmp/ffmpeg_debug.log.
+    # (process dies before it can even print its banner). Retry several times
+    # with a growing backoff, write to a temp file so a killed attempt can
+    # never leave a half-encoded file behind, and keep diagnostics in
+    # data/tmp/ffmpeg_debug.log so the next occurrence is diagnosable.
     binary = ffmpeg_binary()
-    attempts = 3
+    attempts = _transcode_attempts()
+    backoff = (5, 15, 30, 60)
     result = None
     last_error = ""
+    partial = video_file.with_name(f"{video_file.stem}.part{video_file.suffix}")
     for attempt in range(1, attempts + 1):
+        partial.unlink(missing_ok=True)
         started = time.time()
         result = subprocess.run(
             [
@@ -137,16 +144,20 @@ def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
                 "aac",
                 "-movflags",
                 "+faststart",
-                str(video_file),
+                str(partial),
             ],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             stdin=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW,
         )
         elapsed = time.time() - started
-        if result.returncode == 0:
+        if result.returncode == 0 and partial.exists() and partial.stat().st_size > 0:
+            # Atomic publish: the cached-file check in import_local_video only
+            # ever sees a complete transcode.
+            os.replace(partial, video_file)
             return
         last_error = (
             f"attempt {attempt}/{attempts}: rc={result.returncode} elapsed={elapsed:.2f}s "
@@ -154,15 +165,25 @@ def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
         )
         _debug_log(last_error + "\n" + (result.stderr or "")[-4000:])
         if attempt < attempts:
-            video_file.unlink(missing_ok=True)
-            time.sleep(5)
+            partial.unlink(missing_ok=True)
+            wait = backoff[min(attempt - 1, len(backoff) - 1)]
+            _debug_log(f"waiting {wait}s before attempt {attempt + 1}/{attempts}")
+            time.sleep(wait)
     if result is not None and result.returncode != 0:
+        partial.unlink(missing_ok=True)
         _debug_log(_ffmpeg_environment_report(binary))
         raise RuntimeError(
             f"ffmpeg failed with exit code {result.returncode}: "
             f"{(result.stderr or '').strip().splitlines()[-1] if (result.stderr or '').strip() else '(no stderr)'}"
             f" [{last_error}]"
         )
+
+
+def _transcode_attempts() -> int:
+    raw = os.getenv("YOUDUB_TRANSCODE_ATTEMPTS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return 5
 
 
 def import_local_video(url: str, workfolder: Path, source: SourceConfig) -> tuple[Path, dict]:
