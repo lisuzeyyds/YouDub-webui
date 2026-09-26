@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -11,13 +12,17 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import database, gpu_memory, runtime_security
+from . import database, gpu_memory, runtime_security, worker_selfheal
 from .config import WORKFOLDER
 from .devices import device_plan_summary
 from .runtime_checks import validate_runtime_device
 from .sources import detect_source
 from .stages import STAGES
 from .youtube import is_local_upload_url
+
+# Stages whose failures can be caused by the worker being unable to spawn
+# ffmpeg (see worker_selfheal).
+FFMPEG_STAGES = {"download", "separate", "merge_audio", "merge_video"}
 
 
 def _stage_attempts() -> int:
@@ -182,6 +187,30 @@ class PipelineRunner:
                 exc,
                 context="task failure",
             )
+            self._self_heal_if_ffmpeg_broken(failed_stage, exc)
+
+    def _self_heal_if_ffmpeg_broken(self, failed_stage: str | None, exc: Exception) -> None:
+        """Restart the worker when it can no longer start ffmpeg at all.
+
+        On this host the worker process occasionally degrades into a state
+        where every ffmpeg child exits with code 1 and prints nothing, while a
+        freshly started process runs the same command fine. A cheap probe
+        detects it; exiting the process lets the launcher start a clean one,
+        and the task is resumed automatically on the next startup.
+        """
+        if failed_stage not in FFMPEG_STAGES:
+            return
+        if worker_selfheal.ffmpeg_healthy():
+            return
+        self.log(
+            f"[{failed_stage}] this worker process cannot start ffmpeg any more "
+            f"(probe failed: {exc}) - requesting an automatic service restart "
+            f"and will resume this task on startup"
+        )
+        worker_selfheal.request_restart(self.task_id, failed_stage, str(exc))
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(3)
 
     def log(self, message: str) -> None:
         _write_log(self.task_id, message)

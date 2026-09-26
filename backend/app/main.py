@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, SecretStr
 
-from . import auth, database, runtime_security, worker
+from . import auth, database, runtime_security, worker, worker_selfheal
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_client import validate_openai_base_url
@@ -129,7 +129,12 @@ async def lifespan(app: FastAPI):
     database.delete_expired_auth_sessions(database.now_iso())
     database.backfill_titles_from_metadata()
     database.fail_stale_active_tasks()
+    # A previous worker may have exited because it could no longer spawn
+    # ffmpeg; a fresh process can, so pick that task back up automatically.
+    self_healed_task = worker_selfheal.take_pending_resume()
     worker.start(run_task)
+    if self_healed_task:
+        worker.enqueue(self_healed_task)
     yield
 
 
