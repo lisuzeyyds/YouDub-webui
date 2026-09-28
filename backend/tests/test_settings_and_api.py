@@ -1774,6 +1774,18 @@ def test_frontend_video_accept_contract_matches_backend_allowlist():
     for extension in extensions:
         assert main._clean_upload_filename(f"clip{extension.upper()}") == f"clip{extension}"
 
+    audio_extensions = contract["audio_extensions"]
+
+    assert len(audio_extensions) == len(set(audio_extensions))
+    assert all(
+        extension.startswith(".") and extension == extension.lower()
+        for extension in audio_extensions
+    )
+    assert set(audio_extensions) == main.ALLOWED_AUDIO_SUFFIXES
+    assert not set(audio_extensions) & set(extensions)
+    for extension in audio_extensions:
+        assert main._clean_upload_filename(f"clip{extension.upper()}") == f"clip{extension}"
+
 
 def test_upload_local_video_can_save_translated_srt(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)

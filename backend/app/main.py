@@ -31,6 +31,11 @@ from .stages import STAGE_NAMES
 from .youtube import LOCAL_UPLOAD_DIRECTIONS, is_local_upload_url, validate_video_url
 
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv"}
+# Audio-only uploads are accepted too: local_video builds a black video track
+# for them, so subtitle/translation workflows work for songs, podcasts and
+# audio rips (e.g. Bilibili audio downloads).
+ALLOWED_AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus", ".wma", ".aiff"}
+ALLOWED_MEDIA_SUFFIXES = ALLOWED_VIDEO_SUFFIXES | ALLOWED_AUDIO_SUFFIXES
 ALLOWED_SUBTITLE_SUFFIXES = {".srt"}
 LOCAL_UPLOAD_CHUNK_SIZE = 1024 * 1024
 MAX_LOCAL_UPLOAD_BYTES = int(os.getenv("LOCAL_UPLOAD_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
@@ -372,7 +377,7 @@ def _clean_upload_filename(filename: str | None) -> str:
     if not original:
         raise HTTPException(status_code=422, detail="Video filename is required.")
     suffix = Path(original).suffix.lower()
-    if suffix not in ALLOWED_VIDEO_SUFFIXES:
+    if suffix not in ALLOWED_MEDIA_SUFFIXES:
         raise HTTPException(status_code=422, detail="Unsupported video file type.")
     safe_stem = sanitize_text(Path(original).stem) or "video"
     return f"{safe_stem}{suffix}"

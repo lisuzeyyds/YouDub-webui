@@ -14,6 +14,22 @@ from ..sanitize import sanitize_text
 from ..sources import SourceConfig
 from ..youtube import local_upload_task_id
 
+# Audio-only uploads are supported: they get a synthetic black video track so
+# subtitle/translation workflows work for songs, podcasts and audio rips.
+AUDIO_SUFFIXES = {
+    ".m4a",
+    ".mp3",
+    ".wav",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".wma",
+    ".aiff",
+}
+AUDIO_FRAME_SIZE = "1920x1080"
+AUDIO_FRAME_RATE = "24"
+
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
@@ -108,6 +124,68 @@ def _ffmpeg_environment_report(binary: str) -> str:
     return "\n".join(lines)
 
 
+def _transcode_command(binary: str, source_file: Path, target: Path) -> list[str]:
+    """Build the ffmpeg command that turns an upload into media/video_source.mp4.
+
+    Audio-only uploads (songs, podcasts, Bilibili audio rips) get a synthetic
+    black video track so the rest of the pipeline - subtitles, translation,
+    hard-sub rendering - works exactly like it does for real videos. The
+    original audio is kept as the audio track.
+    """
+    if source_file.suffix.lower() in AUDIO_SUFFIXES:
+        return [
+            binary,
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={AUDIO_FRAME_SIZE}:r={AUDIO_FRAME_RATE}",
+            "-i",
+            str(source_file),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(target),
+        ]
+    return [
+        binary,
+        "-nostdin",
+        "-y",
+        "-i",
+        str(source_file),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(target),
+    ]
+
+
 def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
     # ffmpeg can fail spuriously on Windows with exit 1 and no stderr output
     # (process dies before it can even print its banner). Retry several times
@@ -124,28 +202,7 @@ def _transcode_to_mp4(source_file: Path, video_file: Path) -> None:
         partial.unlink(missing_ok=True)
         started = time.time()
         result = subprocess.run(
-            [
-                binary,
-                "-nostdin",
-                "-y",
-                "-i",
-                str(source_file),
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0?",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart",
-                str(partial),
-            ],
+            _transcode_command(binary, source_file, partial),
             capture_output=True,
             text=True,
             encoding="utf-8",

@@ -8,5 +8,16 @@
     ".avi",
     ".flv",
     ".wmv"
+  ],
+  "audio_extensions": [
+    ".m4a",
+    ".mp3",
+    ".wav",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".wma",
+    ".aiff"
   ]
 }

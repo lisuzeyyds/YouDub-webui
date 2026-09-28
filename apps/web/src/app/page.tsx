@@ -44,7 +44,10 @@ import {
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 const TASK_SEARCH_MAX_LENGTH = 200
-const LOCAL_VIDEO_ACCEPT = uploadContract.video_extensions.join(",")
+const LOCAL_VIDEO_ACCEPT = [
+  ...uploadContract.video_extensions,
+  ...uploadContract.audio_extensions,
+].join(",")
 
 function truncateSearchQuery(value: string) {
   return Array.from(value).slice(0, TASK_SEARCH_MAX_LENGTH).join("")

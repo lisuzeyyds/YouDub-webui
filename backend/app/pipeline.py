@@ -12,7 +12,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import database, gpu_memory, runtime_security, worker_selfheal
+from . import database, gpu_memory, memory_guard, runtime_security, worker_selfheal
 from .config import WORKFOLDER
 from .devices import device_plan_summary
 from .runtime_checks import validate_runtime_device
@@ -331,6 +331,9 @@ class PipelineRunner:
             error_message=None,
         )
         self.stage_message(stage, "Started" if attempt == 1 else f"Retry {attempt}/{attempts}")
+        # Make sure the host has enough committable memory before ffmpeg-heavy
+        # work starts; otherwise the failure surfaces as an opaque ffmpeg error.
+        memory_guard.ensure_available_memory(stage, self.log)
         try:
             self._stage_handlers[stage](database.get_task(self.task_id))
         except Exception as stage_exc:
