@@ -58,7 +58,7 @@ describe("本地视频字幕选择", () => {
       </LanguageProvider>,
     )
 
-    const videoInput = screen.getByLabelText("本地视频文件") as HTMLInputElement
+    const videoInput = screen.getByLabelText("本地视频/音频文件") as HTMLInputElement
     const subtitleInput = screen.getByLabelText("已翻译 SRT 字幕（可选）") as HTMLInputElement
     expect(videoInput.accept).toBe(
       [...uploadContract.video_extensions, ...uploadContract.audio_extensions].join(","),
@@ -100,6 +100,44 @@ describe("本地视频字幕选择", () => {
     expect(mocks.push).toHaveBeenCalledWith("/tasks/task-b")
   })
 
+  it("字幕位置选了非 srt 文件时给出明确提示且不提交", async () => {
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.startsWith("/api/tasks")) {
+        return new Response(JSON.stringify({
+          tasks: [],
+          total: 0,
+          active_count: 0,
+          page: 1,
+          page_size: 20,
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      return new Response("{}", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    })
+    // Windows file dialogs can still pick "all files", so bypass the accept
+    // filter here to reproduce what the user did.
+    const user = userEvent.setup({ applyAccept: false })
+    render(
+      <LanguageProvider>
+        <Home />
+      </LanguageProvider>,
+    )
+    const videoInput = screen.getByLabelText("本地视频/音频文件") as HTMLInputElement
+    const subtitleInput = screen.getByLabelText("已翻译 SRT 字幕（可选）") as HTMLInputElement
+
+    await user.upload(videoInput, new File(["audio"], "song.m4a", { type: "audio/mp4" }))
+    await user.upload(subtitleInput, new File(["audio"], "song.m4a", { type: "audio/mp4" }))
+
+    expect(await screen.findByText(/字幕只支持 \.srt 文件/)).toBeInTheDocument()
+    expect(subtitleInput.files).toHaveLength(0)
+  })
+
   it("可选择日译中并以 ja-zh 方向提交本地视频", async () => {
     mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
       const path = String(input)
@@ -133,7 +171,7 @@ describe("本地视频字幕选择", () => {
     )
 
     await user.upload(
-      screen.getByLabelText("本地视频文件"),
+      screen.getByLabelText("本地视频/音频文件"),
       new File(["video"], "japanese.mp4", { type: "video/mp4" }),
     )
     await user.click(screen.getByLabelText("翻译方向"))

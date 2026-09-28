@@ -219,7 +219,18 @@ export default function Home() {
 
   function selectLocalSubtitleFile(event: ChangeEvent<HTMLInputElement>) {
     setError("")
-    setLocalSubtitleFile(event.target.files?.[0] || null)
+    const file = event.target.files?.[0] || null
+    // The subtitle slot only takes .srt; catch audio/video files picked here
+    // (the OS dialog can still switch to "all files") before submitting.
+    if (file && !file.name.toLowerCase().endsWith(".srt")) {
+      setError(t.home.localSubtitleMustBeSrt)
+      setLocalSubtitleFile(null)
+      if (subtitleInputRef.current) {
+        subtitleInputRef.current.value = ""
+      }
+      return
+    }
+    setLocalSubtitleFile(file)
   }
 
   async function submitTask(event: FormEvent<HTMLFormElement>) {
