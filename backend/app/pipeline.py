@@ -12,9 +12,10 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import database, gpu_memory, memory_guard, runtime_security, worker_selfheal
+from . import audio_mode, database, gpu_memory, memory_guard, runtime_security, worker_selfheal
 from .config import WORKFOLDER
 from .devices import device_plan_summary
+from .errors import DeterministicStageError
 from .runtime_checks import validate_runtime_device
 from .sources import detect_source
 from .stages import STAGES
@@ -47,9 +48,12 @@ def _is_transient_stage_error(exc: BaseException) -> bool:
     Child processes on this host are occasionally killed by the surrounding
     sandbox job (exit code 1, no stderr), which clears on its own - those are
     RuntimeError/OSError. Deterministic failures (bad input, missing file,
-    invalid mode) are not retried so a genuinely broken task fails fast.
+    invalid mode, exhausted API balance) are not retried so a genuinely broken
+    task fails fast with an actionable message instead of burning attempts.
     """
     if isinstance(exc, (ValueError, FileNotFoundError, KeyError, AssertionError, ImportError)):
+        return False
+    if isinstance(exc, DeterministicStageError):
         return False
     return isinstance(exc, (RuntimeError, OSError, subprocess.SubprocessError))
 
@@ -627,6 +631,12 @@ class PipelineRunner:
         translation_file = _require(self.artifacts.translation_file, "translation_file")
         vocals_dir = _require(self.artifacts.vocals_dir, "vocals_dir")
         vocals_file = _require(self.artifacts.vocals_file, "vocals_file")
+        coercion = audio_mode.coerce_empty_tts_segments_to_original(translation_file)
+        if coercion:
+            self.log(
+                f"[tts] {coercion} segment(s) had empty target text; "
+                "kept their original audio instead of failing the stage"
+            )
         progress = lambda progress, message: self.stage_progress("tts", progress, message)
         backend = "indextts" if (os.getenv("INDEXTTS_API_URL") or "").strip() else "voxcpm"
         if backend == "indextts":
@@ -637,6 +647,7 @@ class PipelineRunner:
                 vocals_dir,
                 session,
                 progress_callback=progress,
+                original_vocals_file=vocals_file,
             )
         else:
             from .adapters.voxcpm import generate_tts as voxcpm_generate

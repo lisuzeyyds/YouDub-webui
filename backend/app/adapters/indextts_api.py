@@ -11,6 +11,9 @@ from typing import Callable
 
 from pydub import AudioSegment
 
+from ..audio_mode import is_original_audio, target_text
+from .original_audio import write_original_target_audio
+
 
 class IndexTTSApiError(RuntimeError):
     pass
@@ -67,8 +70,13 @@ def _request_json(path: str, payload: dict) -> bytes:
     return result
 
 
-def _longest_reference(vocals_dir: Path) -> Path:
-    files = sorted(vocals_dir.glob("*.wav"))
+def _longest_reference(vocals_dir: Path, exclude: set[int] | None = None) -> Path:
+    excluded = exclude or set()
+    files = [
+        path
+        for path in sorted(vocals_dir.glob("*.wav"))
+        if not (path.stem.isdigit() and int(path.stem) in excluded)
+    ]
     if not files:
         raise IndexTTSApiError("没有找到可用于 IndexTTS 克隆音色的参考音频。")
     return max(files, key=lambda path: len(AudioSegment.from_file(path)))
@@ -90,10 +98,13 @@ def _copy_reference(reference: Path, voices_dir: Path) -> str:
     return target.name
 
 
-def _text(item: dict) -> str:
-    value = item.get("dst") or item.get("zh", "")
+def _text(item: dict, index: int) -> str:
+    value = target_text(item)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("target text must be a non-empty string")
+        raise IndexTTSApiError(
+            f"第 {index} 段译文为空，无法合成语音。"
+            "如果该段是非语言人声，请在翻译结果里把 audio_mode 标为 original。"
+        )
     return " ".join(value.replace("\n", " ").split())
 
 
@@ -142,6 +153,8 @@ def generate_tts(
     vocals_dir: Path,
     session: Path,
     progress_callback: Callable[[int, str], None] | None = None,
+    *,
+    original_vocals_file: Path | None = None,
 ) -> Path:
     output_dir = session / "segments" / "tts"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -151,19 +164,36 @@ def generate_tts(
             progress_callback(100, "No TTS clips to generate")
         return output_dir
 
+    if any(is_original_audio(item) for item in items) and original_vocals_file is None:
+        raise IndexTTSApiError(
+            "翻译结果里存在需要保留原声的片段（audio_mode=original），"
+            "但没有提供原始人声音轨，无法生成该片段的音频。"
+        )
+
+    original_indices = {
+        index for index, item in enumerate(items, start=1) if is_original_audio(item)
+    }
     voices_dir = _voices_dir()
-    fallback_reference = _longest_reference(vocals_dir)
     base_payload = _optional_payload()
+    fallback_reference: Path | None = None
 
     for index, item in enumerate(items, start=1):
         output_file = output_dir / f"{index:04d}.wav"
-        if not output_file.exists():
+        if is_original_audio(item):
+            # Non-verbal / filler segments keep the source performance. merge_tts_audio
+            # still expects one wav per item, so always refresh this slot from the
+            # original vocals track.
+            assert original_vocals_file is not None
+            write_original_target_audio(output_file, item, original_vocals_file)
+        elif not output_file.exists():
+            if fallback_reference is None:
+                fallback_reference = _longest_reference(vocals_dir, exclude=original_indices)
             reference = _pick_reference(vocals_dir, index, fallback_reference)
             reference_name = _copy_reference(reference, voices_dir)
             payload = {
                 **base_payload,
                 "audio": reference_name,
-                "text": _text(item),
+                "text": _text(item, index),
             }
             output_file.write_bytes(_request_json("tts", payload))
         if progress_callback:

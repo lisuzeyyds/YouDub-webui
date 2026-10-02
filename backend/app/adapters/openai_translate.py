@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+)
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from ..errors import DeterministicStageError
 from ..sources import SourceConfig
 from ._translate_prompts import (
     CONTENT_ONLY_TRANSLATION_RULES,
@@ -23,8 +32,26 @@ log = logging.getLogger(__name__)
 API_SETTING_KEYS = ("base_url", "api_key", "model")
 PREPROCESS_RETRY = 2
 TRANSLATE_RETRY = 2
+TRANSLATE_ATTEMPTS = 4
+TRANSPORT_BACKOFF = (2, 5, 10, 20)
 DESCRIPTION_LIMIT = 500
 DEFAULT_CONCURRENCY = 50
+
+_TRANSIENT_STATUS = {408, 409, 425, 429}
+_QUOTA_MARKERS = (
+    "insufficient_user_quota",
+    "insufficient_quota",
+    "余额不足",
+    "quota",
+)
+
+
+class TranslationApiError(DeterministicStageError):
+    """The endpoint answered, but the request can never succeed as configured."""
+
+
+class TransientApiError(RuntimeError):
+    """A network-level hiccup that is worth retrying."""
 
 
 class HotwordItem(BaseModel):
@@ -52,6 +79,48 @@ class TranslationItem(BaseModel):
         if self.audio_mode == "tts" and not self.dst.strip():
             raise ValueError("dst must be non-empty when audio_mode is tts")
         return self
+
+
+def _error_body(exc: APIStatusError) -> str:
+    """Everything the endpoint told us, whichever attribute it landed in."""
+    parts: list[str] = [str(exc)]
+    body = getattr(exc, "body", None)
+    if body is not None:
+        if isinstance(body, str):
+            parts.append(body)
+        else:
+            try:
+                parts.append(json.dumps(body, ensure_ascii=False))
+            except (TypeError, ValueError):
+                parts.append(str(body))
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            parts.append(response.text)
+        except Exception:  # noqa: BLE001 - response body may be already consumed
+            pass
+    return " ".join(part for part in parts if part)
+
+
+def _api_error_message(exc: APIStatusError) -> str:
+    body = _error_body(exc)
+    status = getattr(exc, "status_code", None)
+    lowered = body.lower()
+    if any(marker.lower() in lowered for marker in _QUOTA_MARKERS):
+        return (
+            f"翻译接口账户额度不足（HTTP {status}，服务端返回“余额不足”）。"
+            "请到接口服务商控制台充值，或更换 API Key / 模型后重试。"
+        )
+    if status in (401, 403):
+        return (
+            f"翻译接口拒绝访问（HTTP {status}）：API Key 无效、无权限或额度不足，"
+            f"请在设置里检查接口配置。原文：{body[:200]}"
+        )
+    if status == 404:
+        return (
+            f"翻译接口找不到模型（HTTP 404）：请检查设置里的模型名。原文：{body[:200]}"
+        )
+    return f"翻译接口返回错误（HTTP {status}）：{body[:300]}"
 
 
 def list_models(*, base_url: str, api_key: str) -> list[str]:
@@ -97,14 +166,24 @@ def _extract_json(raw: str) -> dict[str, Any]:
 
 
 def _call_json(client: OpenAI, model: str, system: str, user: str) -> dict[str, Any]:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+        )
+    except (APIConnectionError, APITimeoutError) as exc:
+        # "Server disconnected without sending a response." lands here; the relay
+        # under high concurrency does this occasionally and recovers on its own.
+        raise TransientApiError(f"{type(exc).__name__}: {exc}") from exc
+    except APIStatusError as exc:
+        status = getattr(exc, "status_code", None)
+        if status in _TRANSIENT_STATUS or (isinstance(status, int) and status >= 500):
+            raise TransientApiError(f"HTTP {status}: {str(exc)[:200]}") from exc
+        raise TranslationApiError(_api_error_message(exc)) from exc
     raw = response.choices[0].message.content or "{}"
     return _extract_json(raw)
 
@@ -147,6 +226,13 @@ def preprocess(
         try:
             data = _call_json(client, model, "You output strict JSON only.", user)
             return PreprocessResponse.model_validate(data)
+        except TranslationApiError:
+            raise
+        except TransientApiError as exc:
+            last_error = exc
+            log.warning("preprocess attempt %d failed: %s", attempt + 1, exc)
+            if attempt < PREPROCESS_RETRY:
+                time.sleep(_backoff(attempt))
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
             log.warning("preprocess attempt %d failed: %s", attempt + 1, exc)
@@ -172,23 +258,120 @@ def _post_process(text: str, target_language: str) -> str:
     return cleaned
 
 
+def _backoff(attempt: int) -> float:
+    """Seconds to wait before retry `attempt` (0-based)."""
+    return float(TRANSPORT_BACKOFF[min(attempt, len(TRANSPORT_BACKOFF) - 1)])
+
+
 def translate_sentence(
     text: str,
     target_language: str,
     client: OpenAI,
     model: str,
     system: str,
+    *,
+    attempts: int = TRANSLATE_ATTEMPTS,
 ) -> TranslationItem:
-    last_error: Exception | None = None
-    for attempt in range(TRANSLATE_RETRY):
+    parse_failures = 0
+    attempts = max(1, attempts)
+    last_transport: Exception | None = None
+    for attempt in range(attempts):
         try:
             data = _call_json(client, model, system, text)
             item = TranslationItem.model_validate(data)
             return item.model_copy(update={"dst": _post_process(item.dst, target_language)})
+        except TranslationApiError:
+            raise
+        except TransientApiError as exc:
+            last_transport = exc
+            log.warning(
+                "translate transport failure (attempt %d/%d) for %r: %s",
+                attempt + 1,
+                attempts,
+                text[:60],
+                exc,
+            )
+            if attempt < attempts - 1:
+                time.sleep(_backoff(attempt))
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            last_error = exc
-            log.warning("translate attempt %d failed for %r: %s", attempt + 1, text[:60], exc)
-    raise RuntimeError(f"translate_sentence failed after {TRANSLATE_RETRY} attempts: {last_error}")
+            parse_failures += 1
+            log.warning("translate attempt %d failed for %r: %s", parse_failures, text[:60], exc)
+            if parse_failures >= TRANSLATE_RETRY:
+                raise RuntimeError(
+                    f"translate_sentence failed after {parse_failures} attempts: {exc}"
+                ) from exc
+    raise RuntimeError(f"translate_sentence failed after {attempts} attempts: {last_transport}")
+
+
+class TranslationCache:
+    """Per-sentence translation cache.
+
+    The relay endpoint occasionally drops one connection in the middle of a
+    batch. Without a cache that single hiccup throws away every already
+    translated (and already paid for) sentence, so a retry restarts from zero
+    and can hit the same flake again. Entries are keyed by source text and
+    invalidated whenever the model or the system prompt changes.
+    """
+
+    def __init__(self, path: Path, fingerprint: str) -> None:
+        self.path = path
+        self.fingerprint = fingerprint
+        self._lock = threading.Lock()
+        self._items = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("ignoring unreadable translation cache %s: %s", self.path, exc)
+            return {}
+        if not isinstance(raw, dict) or raw.get("fingerprint") != self.fingerprint:
+            return {}
+        items = raw.get("items")
+        return items if isinstance(items, dict) else {}
+
+    @staticmethod
+    def key(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def get(self, text: str) -> TranslationItem | None:
+        entry = self._items.get(self.key(text))
+        if not isinstance(entry, dict):
+            return None
+        try:
+            return TranslationItem.model_validate(entry)
+        except ValidationError:
+            return None
+
+    def put(self, text: str, item: TranslationItem) -> None:
+        with self._lock:
+            self._items[self.key(text)] = item.model_dump()
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(
+                    json.dumps(
+                        {"fingerprint": self.fingerprint, "items": self._items},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                log.warning("could not persist translation cache %s: %s", self.path, exc)
+
+    @property
+    def size(self) -> int:
+        return len(self._items)
+
+
+def translation_cache_path(session: Path, target_language: str) -> Path:
+    return session / "metadata" / f"translation_cache.{target_language}.json"
+
+
+def _cache_fingerprint(system: str, model: str) -> str:
+    return hashlib.sha1(f"{model}\n{system}".encode("utf-8")).hexdigest()
 
 
 def translate_batch(
@@ -201,19 +384,59 @@ def translate_batch(
     api_key: str,
     model: str,
     concurrency: int = DEFAULT_CONCURRENCY,
+    session: Path | None = None,
 ) -> list[TranslationItem]:
     if not texts:
         return []
     system = _translate_system(source, meta, pre)
     client = _client(base_url, api_key)
-    log.info(
-        "translate_batch: %d sentences, concurrency=%d", len(texts), concurrency,
+    cache = (
+        TranslationCache(
+            translation_cache_path(session, source.target_language),
+            _cache_fingerprint(system, model),
+        )
+        if session is not None
+        else None
     )
+    log.info(
+        "translate_batch: %d sentences, concurrency=%d, cached=%d",
+        len(texts),
+        concurrency,
+        0 if cache is None else cache.size,
+    )
+
+    counter = {"done": 0}
+    counter_lock = threading.Lock()
+
+    def work(text: str) -> TranslationItem:
+        if cache is not None:
+            cached = cache.get(text)
+            if cached is not None:
+                with counter_lock:
+                    counter["done"] += 1
+                return cached
+        item = translate_sentence(text, source.target_language, client, model, system)
+        if cache is not None:
+            cache.put(text, item)
+        with counter_lock:
+            counter["done"] += 1
+        return item
+
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        return list(pool.map(
-            lambda t: translate_sentence(t, source.target_language, client, model, system),
-            texts,
-        ))
+        try:
+            return list(pool.map(work, texts))
+        except TranslationApiError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            done = counter["done"]
+            detail = (
+                f"翻译接口网络异常：{exc}"
+                if isinstance(exc, TransientApiError)
+                else str(exc)
+            )
+            raise RuntimeError(
+                f"{detail}（已完成 {done}/{len(texts)} 句，进度已缓存，重试会接着跑）"
+            ) from exc
 
 
 def _read_meta(session: Path) -> dict[str, Any]:
@@ -290,7 +513,13 @@ def translate_asr(
     else:
         log.info("Reusing translation preprocess artifact from %s", preprocess_artifact_path(session))
     translated_items = translate_batch(
-        texts, source, meta, pre, **api, concurrency=_concurrency_from(settings)
+        texts,
+        source,
+        meta,
+        pre,
+        **api,
+        concurrency=_concurrency_from(settings),
+        session=session,
     )
 
     translation = [

@@ -205,13 +205,11 @@ def test_manual_subtitles_continue_skips_inapplicable_stages_and_finishes(monkey
     assert stages["merge_video"]["status"] == "succeeded"
 
 
-def test_tts_stage_passes_original_vocals_file(monkeypatch, tmp_path):
-    from backend.app.adapters import voxcpm
-
+def _tts_stage_runner(monkeypatch, tmp_path, task_id: str):
     configure_db(monkeypatch, tmp_path)
-    task_id = database.create_task(
-        "https://www.youtube.com/watch?v=ttsoriginal",
-        task_id="ttsoriginal",
+    database.create_task(
+        f"https://www.youtube.com/watch?v={task_id}",
+        task_id=task_id,
     )
     session = tmp_path / "session"
     translation_file = session / "metadata" / "translation.zh.json"
@@ -228,6 +226,16 @@ def test_tts_stage_passes_original_vocals_file(monkeypatch, tmp_path):
     runner.artifacts.translation_file = translation_file
     runner.artifacts.vocals_dir = vocals_dir
     runner.artifacts.vocals_file = vocals_file
+    return runner, session, translation_file, vocals_dir, vocals_file
+
+
+def test_tts_stage_passes_original_vocals_file(monkeypatch, tmp_path):
+    from backend.app.adapters import voxcpm
+
+    monkeypatch.delenv("INDEXTTS_API_URL", raising=False)
+    runner, session, translation_file, vocals_dir, vocals_file = _tts_stage_runner(
+        monkeypatch, tmp_path, "ttsoriginal"
+    )
     received: dict[str, object] = {}
 
     def fake_generate_tts(translation, references, session_dir, **kwargs):
@@ -243,7 +251,7 @@ def test_tts_stage_passes_original_vocals_file(monkeypatch, tmp_path):
 
     monkeypatch.setattr(voxcpm, "generate_tts", fake_generate_tts)
 
-    runner._tts(database.get_task(task_id))
+    runner._tts(database.get_task("ttsoriginal"))
 
     assert received == {
         "translation": translation_file,
@@ -251,6 +259,74 @@ def test_tts_stage_passes_original_vocals_file(monkeypatch, tmp_path):
         "session_dir": session,
         "original_vocals_file": vocals_file,
     }
+
+
+def test_indextts_stage_passes_original_vocals_file(monkeypatch, tmp_path):
+    from backend.app.adapters import indextts_api
+
+    monkeypatch.setenv("INDEXTTS_API_URL", "http://127.0.0.1:9005")
+    runner, session, translation_file, vocals_dir, vocals_file = _tts_stage_runner(
+        monkeypatch, tmp_path, "indexttsoriginal"
+    )
+    received: dict[str, object] = {}
+
+    def fake_generate_tts(translation, references, session_dir, **kwargs):
+        received.update(
+            translation=translation,
+            references=references,
+            session_dir=session_dir,
+            original_vocals_file=kwargs["original_vocals_file"],
+        )
+        output = session_dir / "segments" / "tts"
+        output.mkdir(parents=True, exist_ok=True)
+        return output
+
+    monkeypatch.setattr(indextts_api, "generate_tts", fake_generate_tts)
+
+    runner._tts(database.get_task("indexttsoriginal"))
+
+    assert received == {
+        "translation": translation_file,
+        "references": vocals_dir,
+        "session_dir": session,
+        "original_vocals_file": vocals_file,
+    }
+
+
+def test_tts_stage_keeps_original_audio_when_translation_is_blank(monkeypatch, tmp_path):
+    from backend.app.adapters import voxcpm
+
+    monkeypatch.delenv("INDEXTTS_API_URL", raising=False)
+    runner, session, translation_file, vocals_dir, vocals_file = _tts_stage_runner(
+        monkeypatch, tmp_path, "ttsblank"
+    )
+    translation_file.write_text(
+        json.dumps(
+            {
+                "translation": [
+                    {"dst": "有译文。", "audio_mode": "tts"},
+                    {"dst": "", "audio_mode": "tts"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    logged: list[str] = []
+
+    def fake_generate_tts(translation, references, session_dir, **kwargs):
+        output = session_dir / "segments" / "tts"
+        output.mkdir(parents=True, exist_ok=True)
+        return output
+
+    monkeypatch.setattr(voxcpm, "generate_tts", fake_generate_tts)
+    monkeypatch.setattr(runner, "log", logged.append)
+
+    runner._tts(database.get_task("ttsblank"))
+
+    items = json.loads(translation_file.read_text(encoding="utf-8"))["translation"]
+    assert [item["audio_mode"] for item in items] == ["tts", "original"]
+    assert any("empty target text" in line for line in logged)
 
 
 def test_pipeline_skips_already_succeeded_stages(monkeypatch, tmp_path):
@@ -970,3 +1046,53 @@ def test_manual_subtitles_with_uploaded_srt_continues_to_final_merge(monkeypatch
         "succeeded",
         "succeeded",
     ]
+
+
+def test_deterministic_api_errors_are_not_retried(monkeypatch, tmp_path):
+    """An exhausted translation balance must surface once, not be retried 3x."""
+    from backend.app.errors import DeterministicStageError
+
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=quotaerrr",
+        task_id="quotaerrr",
+    )
+    attempts = {"n": 0}
+
+    def failing_translate(*args, **kwargs):
+        attempts["n"] += 1
+        raise DeterministicStageError("翻译接口账户额度不足（HTTP 403）")
+
+    monkeypatch.setattr(pipeline, "_stage_attempts", lambda: 3)
+    monkeypatch.setattr(pipeline, "_stage_retry_delay", lambda: 0)
+    runner = PipelineRunner(task_id)
+    runner._stage_handlers["translate"] = failing_translate
+
+    with pytest.raises(DeterministicStageError):
+        runner._run_stage("translate")
+
+    assert attempts["n"] == 1
+
+
+def test_transient_stage_errors_are_retried(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=flakytttt",
+        task_id="flakytttt",
+    )
+    attempts = {"n": 0}
+    monkeypatch.setattr(pipeline, "_stage_attempts", lambda: 3)
+    monkeypatch.setattr(pipeline, "_stage_retry_delay", lambda: 0)
+    monkeypatch.setattr(pipeline.time, "sleep", lambda *_: None)
+
+    def flaky_translate(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("翻译接口网络异常")
+
+    runner = PipelineRunner(task_id)
+    runner._stage_handlers["translate"] = flaky_translate
+
+    runner._run_stage("translate")
+
+    assert attempts["n"] == 3

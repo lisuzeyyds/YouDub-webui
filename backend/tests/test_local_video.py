@@ -23,6 +23,7 @@ def test_import_local_video_transcodes_with_configured_ffmpeg(monkeypatch, tmp_p
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setenv("FFMPEG_PATH", "/opt/bin/ffmpeg")
+    monkeypatch.setenv("YOUDUB_TRANSCODE_ATTEMPTS", "1")
     monkeypatch.setattr(local_video.subprocess, "run", fake_run)
 
     session, info = local_video.import_local_video(
@@ -36,7 +37,11 @@ def test_import_local_video_transcodes_with_configured_ffmpeg(monkeypatch, tmp_p
     assert info["target_language"] == "en"
     assert commands
     assert commands[0][0] == "/opt/bin/ffmpeg"
-    assert commands[0][-1] == str(session / "media" / "video_source.mp4")
+    # Transcodes are staged in a .part file and published atomically, so a killed
+    # attempt can never leave a truncated video_source.mp4 behind.
+    assert commands[0][-1] == str(session / "media" / "video_source.part.mp4")
+    assert (session / "media" / "video_source.mp4").read_bytes() == b"mp4"
+    assert not (session / "media" / "video_source.part.mp4").exists()
     metadata = json.loads((session / "metadata" / "local_info.json").read_text(encoding="utf-8"))
     assert metadata["original_path"] == str(source_file)
 

@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
+from openai import (
+    APIConnectionError,
+    AuthenticationError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from backend.app.adapters import openai_translate
 from backend.app.adapters.openai_translate import (
     HotwordItem,
     PreprocessResponse,
     CorrectionItem,
+    TransientApiError,
+    TranslationApiError,
 )
 from backend.app.sources import detect_source
 
@@ -16,6 +27,41 @@ from backend.app.sources import detect_source
 YT_SOURCE = detect_source("https://www.youtube.com/watch?v=abcdefghijk")
 BB_SOURCE = detect_source("https://www.bilibili.com/video/BV1xx411c7mD")
 JA_SOURCE = detect_source("local://upload/japanese-task?direction=ja-zh")
+
+
+_STATUS_EXCEPTIONS = {
+    401: AuthenticationError,
+    403: PermissionDeniedError,
+    404: NotFoundError,
+    429: RateLimitError,
+    500: InternalServerError,
+}
+
+
+def _status_error(status: int, payload: dict):
+    request = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    response = httpx.Response(status, request=request, json=payload)
+    message = f"Error code: {status} - {json.dumps(payload, ensure_ascii=False)}"
+    cls = _STATUS_EXCEPTIONS.get(status, InternalServerError)
+    return cls(message, response=response, body=None)
+
+
+def _connection_error():
+    request = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    return APIConnectionError(request=request)
+
+
+class _FakeCompletions:
+    def __init__(self, behaviour):
+        self._behaviour = behaviour
+
+    def create(self, **kwargs):
+        return self._behaviour(kwargs)
+
+
+class _FakeClient:
+    def __init__(self, behaviour):
+        self.chat = type("c", (), {"completions": _FakeCompletions(behaviour)})()
 
 
 def _write_asr(path, n: int, full_text: str | None = None) -> None:
@@ -322,6 +368,216 @@ def test_preprocess_returns_empty_when_repeatedly_invalid(monkeypatch):
     assert pre.summary == ""
     assert pre.hotwords == []
     assert pre.corrections == []
+
+
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr(openai_translate.time, "sleep", lambda *_: None)
+
+
+# --- transport failure handling -------------------------------------------------
+
+
+def test_call_json_maps_quota_error_to_actionable_message():
+    exc = _status_error(
+        403,
+        {"error": {"message": "余额不足", "code": "insufficient_user_quota"}},
+    )
+    client = _FakeClient(lambda kwargs: (_ for _ in ()).throw(exc))
+
+    with pytest.raises(TranslationApiError) as info:
+        openai_translate._call_json(client, "m", "sys", "user")
+
+    message = str(info.value)
+    assert "额度不足" in message
+    assert "充值" in message
+
+
+def test_call_json_marks_connection_drop_as_transient():
+    client = _FakeClient(lambda kwargs: (_ for _ in ()).throw(_connection_error()))
+
+    with pytest.raises(TransientApiError):
+        openai_translate._call_json(client, "m", "sys", "user")
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_call_json_marks_rate_limit_and_server_errors_as_transient(status):
+    exc = _status_error(status, {"error": {"message": "busy"}})
+    client = _FakeClient(lambda kwargs: (_ for _ in ()).throw(exc))
+
+    with pytest.raises(TransientApiError):
+        openai_translate._call_json(client, "m", "sys", "user")
+
+
+def test_translate_sentence_retries_transient_failures(monkeypatch):
+    _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_call_json(client, model, system, user):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise TransientApiError("Server disconnected without sending a response.")
+        return {"dst": "你好。", "audio_mode": "tts"}
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+
+    out = openai_translate.translate_sentence("Hello.", "zh", object(), "m", "sys")
+
+    assert out.model_dump() == {"dst": "你好。", "audio_mode": "tts"}
+    assert calls["n"] == 3
+
+
+def test_translate_sentence_gives_up_after_transport_attempts(monkeypatch):
+    _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_call_json(client, model, system, user):
+        calls["n"] += 1
+        raise TransientApiError("Server disconnected without sending a response.")
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+
+    with pytest.raises(RuntimeError, match="translate_sentence failed after 4 attempts"):
+        openai_translate.translate_sentence("Hello.", "zh", object(), "m", "sys")
+
+    assert calls["n"] == 4
+
+
+def test_translate_sentence_does_not_retry_quota_errors(monkeypatch):
+    _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_call_json(client, model, system, user):
+        calls["n"] += 1
+        raise TranslationApiError("翻译接口账户额度不足")
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+
+    with pytest.raises(TranslationApiError):
+        openai_translate.translate_sentence("Hello.", "zh", object(), "m", "sys")
+
+    assert calls["n"] == 1
+
+
+# --- per-sentence cache ---------------------------------------------------------
+
+
+def _batch(session=None, **kwargs):
+    return openai_translate.translate_batch(
+        ["S0.", "S1.", "S2."],
+        YT_SOURCE,
+        {},
+        PreprocessResponse(),
+        base_url="u",
+        api_key="k",
+        model="m",
+        concurrency=1,
+        session=session,
+        **kwargs,
+    )
+
+
+def test_translate_batch_writes_per_sentence_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        openai_translate,
+        "_call_json",
+        lambda client, model, system, user: {"dst": f"zh:{user}", "audio_mode": "tts"},
+    )
+
+    _batch(tmp_path)
+
+    cached = json.loads(
+        openai_translate.translation_cache_path(tmp_path, "zh").read_text(encoding="utf-8")
+    )
+    assert len(cached["items"]) == 3
+    assert cached["fingerprint"]
+
+
+def test_translate_batch_reuses_cache_without_calling_api(tmp_path, monkeypatch):
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        openai_translate,
+        "_call_json",
+        lambda client, model, system, user: {"dst": f"zh:{user}", "audio_mode": "tts"},
+    )
+    _batch(tmp_path)
+
+    def fail_call_json(*args, **kwargs):
+        raise AssertionError("cached sentences must not hit the API again")
+
+    monkeypatch.setattr(openai_translate, "_call_json", fail_call_json)
+    out = _batch(tmp_path)
+
+    assert [item.dst for item in out] == ["zh:S0.", "zh:S1.", "zh:S2."]
+
+
+def test_translate_batch_keeps_finished_sentences_after_a_drop(tmp_path, monkeypatch):
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    seen: list[str] = []
+
+    def flaky(client, model, system, user):
+        seen.append(user)
+        if user == "S1.":
+            raise TransientApiError("Server disconnected without sending a response.")
+        return {"dst": f"zh:{user}", "audio_mode": "tts"}
+
+    monkeypatch.setattr(openai_translate, "_call_json", flaky)
+
+    with pytest.raises(RuntimeError, match="进度已缓存"):
+        _batch(tmp_path)
+
+    cached = json.loads(
+        openai_translate.translation_cache_path(tmp_path, "zh").read_text(encoding="utf-8")
+    )
+    # S0 and S2 completed; S1 failed and must be retried on the next run.
+    assert len(cached["items"]) == 2
+
+    seen.clear()
+    monkeypatch.setattr(
+        openai_translate,
+        "_call_json",
+        lambda client, model, system, user: (
+            seen.append(user) or {"dst": f"zh:{user}", "audio_mode": "tts"}
+        ),
+    )
+    out = _batch(tmp_path)
+
+    assert [item.dst for item in out] == ["zh:S0.", "zh:S1.", "zh:S2."]
+    assert seen == ["S1."], "only the missing sentence should be translated again"
+
+
+def test_translation_cache_is_ignored_when_the_prompt_changes(tmp_path, monkeypatch):
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        openai_translate,
+        "_call_json",
+        lambda client, model, system, user: {"dst": "旧译文", "audio_mode": "tts"},
+    )
+    _batch(tmp_path)
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        openai_translate,
+        "_call_json",
+        lambda client, model, system, user: (
+            seen.append(user) or {"dst": "新译文", "audio_mode": "tts"}
+        ),
+    )
+    out = openai_translate.translate_batch(
+        ["S0.", "S1.", "S2."],
+        YT_SOURCE,
+        {},
+        PreprocessResponse(summary="a different preprocess summary"),
+        base_url="u",
+        api_key="k",
+        model="m",
+        concurrency=1,
+        session=tmp_path,
+    )
+
+    assert [item.dst for item in out] == ["新译文"] * 3
+    assert len(seen) == 3
 
 
 def test_translate_system_prompt_contains_meta_summary_hotwords(monkeypatch):
