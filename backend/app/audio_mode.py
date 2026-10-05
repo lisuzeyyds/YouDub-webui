@@ -61,3 +61,65 @@ def coerce_empty_tts_segments_to_original(translation_file: Path) -> int:
             json.dumps(data, ensure_ascii=False, indent=2),
         )
     return changed
+
+
+def sanitize_invalid_segment_ranges(
+    translation_file: Path,
+    duration_ms: int | None = None,
+) -> int:
+    """Drop translation rows whose time range cannot exist in the audio.
+
+    Whisper can emit trailing utterances timestamped past the end of the audio;
+    an older ``asr_fix`` clamped ``end_time`` to the duration without clamping
+    ``start_time``, leaving rows with ``start > end``. The TTS backends then try
+    to slice an impossible original-audio range (or a zero-length clip) and fail
+    the whole task, even though every other segment was fine.
+
+    Dropping the row here keeps TTS and the later merges consistent, because all
+    of them read this same artifact. Returns the number of dropped rows.
+    """
+    data = json.loads(translation_file.read_text(encoding="utf-8"))
+    items = data.get("translation")
+    if not isinstance(items, list):
+        return 0
+
+    kept: list[dict] = []
+    dropped = 0
+    changed = False
+    for item in items:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        # Only validate rows that actually carry a time range. Rows without
+        # timestamps (older artifacts, hand-written fixtures) are passed through
+        # untouched - defaulting a missing range to 0-0 would drop them all.
+        if "start_time" not in item and "end_time" not in item:
+            kept.append(item)
+            continue
+        try:
+            start = int(item["start_time"])
+            end = int(item["end_time"])
+        except (KeyError, TypeError, ValueError):
+            dropped += 1
+            continue
+        if duration_ms:
+            if start >= duration_ms:
+                dropped += 1
+                continue
+            end = min(end, duration_ms)
+        if end <= start:
+            dropped += 1
+            continue
+        if start != item.get("start_time") or end != item.get("end_time"):
+            # 只是收窄到音频范围内，行本身保留
+            changed = True
+            item = {**item, "start_time": start, "end_time": end}
+        kept.append(item)
+
+    if dropped or changed:
+        data["translation"] = kept
+        runtime_security.atomic_write_private_text(
+            translation_file,
+            json.dumps(data, ensure_ascii=False, indent=2),
+        )
+    return dropped

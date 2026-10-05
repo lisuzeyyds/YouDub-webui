@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from ..errors import DeterministicStageError
 from ..sources import SourceConfig
 from ._translate_prompts import (
+    BULK_TRANSLATION_PROMPT,
     CONTENT_ONLY_TRANSLATION_RULES,
     PREPROCESS_PROMPT,
     TRANSLATE_RULES,
@@ -36,6 +37,16 @@ TRANSLATE_ATTEMPTS = 4
 TRANSPORT_BACKOFF = (2, 5, 10, 20)
 DESCRIPTION_LIMIT = 500
 DEFAULT_CONCURRENCY = 50
+
+# Bulk (whole-transcript) translation.
+# Sending every sentence in one request gives the model global context (consistent
+# terminology, names, tone) and removes the concurrency that was dropping
+# connections mid-batch. The trade-off is long outputs, which can be truncated,
+# so the reply protocol is one self-contained line per sentence and only the
+# lines that are actually missing get retried individually.
+BULK_MAX_CHARS = 12000
+BULK_ATTEMPTS = 3
+_BULK_LINE_RE = re.compile(r"^\s*(\d+)\s*[\t:：.、]\s*(.*)$")
 
 _TRANSIENT_STATUS = {408, 409, 425, 429}
 _QUOTA_MARKERS = (
@@ -263,6 +274,136 @@ def _backoff(attempt: int) -> float:
     return float(TRANSPORT_BACKOFF[min(attempt, len(TRANSPORT_BACKOFF) - 1)])
 
 
+def _bulk_payload(texts: list[str]) -> str:
+    return "\n".join(f"{index}\t{text}" for index, text in enumerate(texts, start=1))
+
+
+def _bulk_system(source: SourceConfig, meta: dict[str, Any], pre: PreprocessResponse) -> str:
+    return BULK_TRANSLATION_PROMPT.format(
+        system=_translate_system(source, meta, pre),
+        payload="",
+    ).rstrip()
+
+
+def _parse_bulk_reply(raw: str, expected: int) -> dict[int, str]:
+    """Map line number -> translation for a whole-transcript reply.
+
+    Only well-formed ``<n><TAB>text`` lines are kept; anything else (model
+    preamble, markdown fences, a truncated tail) is ignored so a partial reply
+    still yields every line it did contain.
+    """
+    result: dict[int, str] = {}
+    for line in raw.splitlines():
+        match = _BULK_LINE_RE.match(line)
+        if not match:
+            continue
+        number = int(match.group(1))
+        if 1 <= number <= expected and number not in result:
+            result[number] = match.group(2).strip()
+    return result
+
+
+def _call_bulk(client: OpenAI, model: str, system: str, payload: str) -> str:
+    """One plain-text completion for the whole transcript."""
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": payload},
+            ],
+            temperature=0.2,
+        )
+    except (APIConnectionError, APITimeoutError) as exc:
+        raise TransientApiError(f"{type(exc).__name__}: {exc}") from exc
+    except APIStatusError as exc:
+        status = getattr(exc, "status_code", None)
+        if status in _TRANSIENT_STATUS or (isinstance(status, int) and status >= 500):
+            raise TransientApiError(f"HTTP {status}: {str(exc)[:200]}") from exc
+        raise TranslationApiError(_api_error_message(exc)) from exc
+    return response.choices[0].message.content or ""
+
+
+def translate_bulk(
+    texts: list[str],
+    source: SourceConfig,
+    meta: dict[str, Any],
+    pre: PreprocessResponse,
+    *,
+    client: OpenAI,
+    model: str,
+) -> dict[int, str] | None:
+    """Translate the whole transcript in a single request.
+
+    One request means the model sees every sentence together (consistent
+    terminology, names and tone) and there is no concurrency to drop
+    connections. The cost is a long reply that can be truncated, which the
+    numbered-line protocol absorbs: a partial reply still yields every line it
+    did contain, and the caller tops up only the missing ones.
+
+    Returns a mapping of 1-based sentence index to translation, or ``None`` when
+    the bulk request cannot be served (too long / endpoint refused), so the
+    caller falls back to per-sentence translation.
+    """
+    if not texts:
+        return {}
+    payload = _bulk_payload(texts)
+    if len(payload) > BULK_MAX_CHARS:
+        log.info(
+            "bulk translate skipped: payload %d chars exceeds %d",
+            len(payload),
+            BULK_MAX_CHARS,
+        )
+        return None
+    system = _bulk_system(source, meta, pre)
+    last_error: Exception | None = None
+    for attempt in range(BULK_ATTEMPTS):
+        try:
+            raw = _call_bulk(client, model, system, payload)
+        except TranslationApiError:
+            raise
+        except TransientApiError as exc:
+            last_error = exc
+            log.warning(
+                "bulk translate transport failure (attempt %d/%d): %s",
+                attempt + 1,
+                BULK_ATTEMPTS,
+                exc,
+            )
+            if attempt < BULK_ATTEMPTS - 1:
+                time.sleep(_backoff(attempt))
+            continue
+        parsed = _parse_bulk_reply(raw, len(texts))
+        if parsed:
+            log.info(
+                "bulk translate: %d/%d lines parsed from one request",
+                len(parsed),
+                len(texts),
+            )
+            return parsed
+        log.warning(
+            "bulk translate reply had no usable lines (attempt %d/%d); raw[:200]=%r",
+            attempt + 1,
+            BULK_ATTEMPTS,
+            raw[:200],
+        )
+    log.warning("bulk translate gave up after %d attempts: %s", BULK_ATTEMPTS, last_error)
+    return None
+
+
+def _fix_translation_item(dst: str) -> TranslationItem:
+    """Build a TranslationItem from a bulk line, matching the single-sentence rules.
+
+    An empty line means "no information worth speaking": keep the source audio
+    instead of asking TTS to synthesise silence, which is exactly what
+    ``audio_mode=original`` encodes downstream.
+    """
+    value = dst.strip()
+    if not value:
+        return TranslationItem(dst="", audio_mode="original")
+    return TranslationItem(dst=value, audio_mode="tts")
+
+
 def translate_sentence(
     text: str,
     target_language: str,
@@ -422,13 +563,47 @@ def translate_batch(
             counter["done"] += 1
         return item
 
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+    # --- Preferred path: one request for the whole transcript ---
+    # Global context gives better terminology/name consistency, and a single
+    # request cannot drop connections the way a 50-way fan-out can. Only the
+    # sentences the bulk reply actually missed are translated individually, so a
+    # truncated reply costs a few calls instead of the whole stage.
+    results: list[TranslationItem | None] = [None] * len(texts)
+    missing: list[int] = []
+    for index, text in enumerate(texts):
+        cached = cache.get(text) if cache is not None else None
+        if cached is not None:
+            results[index] = cached
+        else:
+            missing.append(index)
+
+    if missing:
+        bulk_input = [texts[index] for index in missing]
+        bulk = translate_bulk(bulk_input, source, meta, pre, client=client, model=model)
+        if bulk is not None:
+            for position, index in enumerate(missing, start=1):
+                if position not in bulk:
+                    continue
+                item = _fix_translation_item(bulk[position])
+                results[index] = item
+                if cache is not None:
+                    cache.put(texts[index], item)
+
+    pending = [index for index, item in enumerate(results) if item is None]
+    if pending:
+        log.info(
+            "translate_batch: %d/%d sentence(s) not covered by the bulk reply; "
+            "translating them individually",
+            len(pending),
+            len(texts),
+        )
         try:
-            return list(pool.map(work, texts))
+            with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+                filled = list(pool.map(work, [texts[index] for index in pending]))
         except TranslationApiError:
             raise
         except Exception as exc:  # noqa: BLE001
-            done = counter["done"]
+            done = sum(1 for item in results if item is not None)
             detail = (
                 f"翻译接口网络异常：{exc}"
                 if isinstance(exc, TransientApiError)
@@ -437,6 +612,10 @@ def translate_batch(
             raise RuntimeError(
                 f"{detail}（已完成 {done}/{len(texts)} 句，进度已缓存，重试会接着跑）"
             ) from exc
+        for index, item in zip(pending, filled):
+            results[index] = item
+
+    return [item for item in results if item is not None]
 
 
 def _read_meta(session: Path) -> dict[str, Any]:

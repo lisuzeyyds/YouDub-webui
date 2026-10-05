@@ -137,6 +137,25 @@ Summary: {summary}
 """
 
 
+BULK_TRANSLATION_PROMPT = """{system}
+
+# 整篇翻译模式（覆盖上面的逐句输出格式）
+这一次用户会把**整篇字幕的所有句子**一次性给你，每行形如 `编号<TAB>原文`。
+你必须**逐行**翻译，并按完全相同的编号逐行输出。
+
+# 输出格式（极其重要）
+- 每行输出：`编号<TAB>译文`，编号与输入完全一致，一行一句，不要合并、不要拆分、不要漏行、不要多行。
+- 译文行数必须与输入行数严格相等。
+- 译文只有正文，不要引号、不要 markdown、不要解释、不要复述原文。
+- 只输出这些行，不要输出任何其他内容。
+- 若某句是无词义的纯声音（笑声、尖叫、喘息等），译文写自然的声音字幕，如「（笑声）」。
+- 若某句是纯语气词、无信息量，译文留空（只写编号和一个制表符），该句会自动保留原声。
+
+# 输入
+{payload}
+"""
+
+
 CONTENT_ONLY_TRANSLATION_RULES = """# Content-only translation priority (highest priority; overrides earlier filler guidance)
 Translate the proposition, facts, requests, and meaningful emotion in each utterance. Do not translate or add standalone discourse fillers, hesitation sounds, acknowledgements, or sentence-ending particles when they carry no information. Examples include English "um", "uh", filler "well", "you know", "like", or "so"; and Chinese "嗯", "啊", "哦", "呢", "吧", or "啦" when they are only modal particles.
 

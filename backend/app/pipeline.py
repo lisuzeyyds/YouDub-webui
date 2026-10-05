@@ -637,6 +637,17 @@ class PipelineRunner:
                 f"[tts] {coercion} segment(s) had empty target text; "
                 "kept their original audio instead of failing the stage"
             )
+        from .adapters.audio import audio_duration_ms
+
+        dropped = audio_mode.sanitize_invalid_segment_ranges(
+            translation_file,
+            duration_ms=audio_duration_ms(vocals_file),
+        )
+        if dropped:
+            self.log(
+                f"[tts] {dropped} segment(s) had a time span outside the audio and "
+                "were dropped instead of failing the stage"
+            )
         progress = lambda progress, message: self.stage_progress("tts", progress, message)
         backend = "indextts" if (os.getenv("INDEXTTS_API_URL") or "").strip() else "voxcpm"
         if backend == "indextts":

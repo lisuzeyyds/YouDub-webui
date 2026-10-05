@@ -38,6 +38,33 @@ _STATUS_EXCEPTIONS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _disable_bulk_translation(monkeypatch):
+    """Keep the per-sentence tests on the per-sentence path.
+
+    translate_batch prefers one request for the whole transcript; these tests
+    stub _call_json/_client for the single-sentence protocol, so the bulk path
+    is disabled here. Tests that exercise bulk restore the real implementation
+    with `_enable_bulk(monkeypatch)`.
+    """
+    _real_translate_bulk = openai_translate.translate_bulk
+    monkeypatch.setattr(
+        openai_translate, "translate_bulk", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        openai_translate, "_REAL_TRANSLATE_BULK", _real_translate_bulk, raising=False
+    )
+
+
+def _enable_bulk(monkeypatch) -> None:
+    """Restore the real bulk implementation (undone by the autouse fixture)."""
+    monkeypatch.setattr(
+        openai_translate,
+        "translate_bulk",
+        openai_translate._REAL_TRANSLATE_BULK,
+    )
+
+
 def _status_error(status: int, payload: dict):
     request = httpx.Request("POST", "https://example.com/v1/chat/completions")
     response = httpx.Response(status, request=request, json=payload)
@@ -673,3 +700,203 @@ def test_japanese_to_chinese_prompt_and_audio_mode_response_contract(monkeypatch
             model="m",
             concurrency=1,
         )
+
+
+# --------------------------------------------------------------------------
+# Bulk (whole-transcript) translation
+# --------------------------------------------------------------------------
+
+
+def test_bulk_payload_numbers_every_sentence():
+    payload = openai_translate._bulk_payload(["Hello.", "World."])
+    assert payload == "1\tHello.\n2\tWorld."
+
+
+def test_parse_bulk_reply_ignores_preamble_and_bad_lines():
+    raw = (
+        "Here are the translations:/n"
+        "```\n"
+        "1\t你好。\n"
+        "2\t世界。\n"
+        "not a numbered line\n"
+        "4\t多余的编号\n"
+    )
+    parsed = openai_translate._parse_bulk_reply(raw, expected=3)
+    assert parsed == {1: "你好。", 2: "世界。"}
+
+
+def test_parse_bulk_reply_keeps_a_truncated_tail():
+    raw = "1\t你好。\n2\t世"
+    parsed = openai_translate._parse_bulk_reply(raw, expected=5)
+    assert parsed == {1: "你好。", 2: "世"}
+
+
+def test_parse_bulk_reply_accepts_colon_and_dot_separators():
+    parsed = openai_translate._parse_bulk_reply("1: 你好。\n2. 世界。", expected=2)
+    assert parsed == {1: "你好。", 2: "世界。"}
+
+
+def test_bulk_line_without_text_keeps_the_source_audio():
+    assert openai_translate._fix_translation_item("   ").model_dump() == {
+        "dst": "",
+        "audio_mode": "original",
+    }
+    assert openai_translate._fix_translation_item("你好。").model_dump() == {
+        "dst": "你好。",
+        "audio_mode": "tts",
+    }
+
+
+def test_translate_bulk_returns_none_when_payload_is_too_long(monkeypatch):
+    _enable_bulk(monkeypatch)
+    monkeypatch.setattr(openai_translate, "BULK_MAX_CHARS", 10)
+    called = {"n": 0}
+
+    def fake_bulk(*args, **kwargs):
+        called["n"] += 1
+        return "1\tx"
+
+    monkeypatch.setattr(openai_translate, "_call_bulk", fake_bulk)
+    out = openai_translate.translate_bulk(
+        ["a very long sentence that blows the budget"], YT_SOURCE, {}, PreprocessResponse(),
+        client=object(), model="m",
+    )
+    assert out is None
+    assert called["n"] == 0
+
+
+def test_translate_bulk_parses_a_single_request(monkeypatch):
+    _enable_bulk(monkeypatch)
+    monkeypatch.setattr(
+        openai_translate, "_call_bulk", lambda *a, **kw: "1\t你好。\n2\t世界。"
+    )
+    out = openai_translate.translate_bulk(
+        ["Hello.", "World."], YT_SOURCE, {}, PreprocessResponse(),
+        client=object(), model="m",
+    )
+    assert out == {1: "你好。", 2: "世界。"}
+
+
+def test_translate_bulk_retries_transport_failures(monkeypatch):
+    _enable_bulk(monkeypatch)
+    monkeypatch.setattr(openai_translate.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TransientApiError("boom")
+        return "1\t你好。"
+
+    monkeypatch.setattr(openai_translate, "_call_bulk", flaky)
+    out = openai_translate.translate_bulk(
+        ["Hello."], YT_SOURCE, {}, PreprocessResponse(), client=object(), model="m",
+    )
+    assert out == {1: "你好。"}
+    assert calls["n"] == 2
+
+
+def test_translate_bulk_propagates_deterministic_errors(monkeypatch):
+    _enable_bulk(monkeypatch)
+
+    def fatal(*args, **kwargs):
+        raise TranslationApiError("余额不足")
+
+    monkeypatch.setattr(openai_translate, "_call_bulk", fatal)
+    with pytest.raises(TranslationApiError, match="余额不足"):
+        openai_translate.translate_bulk(
+            ["Hello."], YT_SOURCE, {}, PreprocessResponse(), client=object(), model="m",
+        )
+
+
+def test_translate_batch_prefers_one_bulk_request(monkeypatch):
+    """The whole transcript goes out in a single call, no per-sentence fan-out."""
+    bulk_calls: list[list[str]] = []
+    single_calls: list[str] = []
+
+    def fake_bulk(texts, source, meta, pre, *, client, model):
+        bulk_calls.append(list(texts))
+        return {i: f"zh{i}" for i in range(1, len(texts) + 1)}
+
+    def fake_sentence(text, *a, **kw):
+        single_calls.append(text)
+        return openai_translate.TranslationItem(dst=f"single:{text}", audio_mode="tts")
+
+    monkeypatch.setattr(openai_translate, "translate_bulk", fake_bulk)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(openai_translate, "_call_json", lambda *a, **kw: {})
+    monkeypatch.setattr(openai_translate, "translate_sentence", fake_sentence)
+
+    texts = [f"s{i}" for i in range(6)]
+    out = openai_translate.translate_batch(
+        texts, BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=4,
+    )
+    assert [item.dst for item in out] == [f"zh{i}" for i in range(1, 7)]
+    assert bulk_calls == [texts]
+    assert single_calls == []
+
+
+def test_translate_batch_tops_up_only_missing_bulk_lines(monkeypatch):
+    """A truncated bulk reply only costs the lines it actually missed."""
+    def fake_bulk(texts, source, meta, pre, *, client, model):
+        return {1: "zh1", 3: "zh3"}
+
+    single_calls: list[str] = []
+
+    def fake_sentence(text, *a, **kw):
+        single_calls.append(text)
+        return openai_translate.TranslationItem(dst=f"single:{text}", audio_mode="tts")
+
+    monkeypatch.setattr(openai_translate, "translate_bulk", fake_bulk)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(openai_translate, "translate_sentence", fake_sentence)
+
+    out = openai_translate.translate_batch(
+        ["a", "b", "c"], BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=3,
+    )
+    assert [item.dst for item in out] == ["zh1", "single:b", "zh3"]
+    assert single_calls == ["b"]
+
+
+def test_translate_batch_falls_back_entirely_when_bulk_is_unavailable(monkeypatch):
+    def fake_sentence(text, *a, **kw):
+        return openai_translate.TranslationItem(dst=f"single:{text}", audio_mode="tts")
+
+    monkeypatch.setattr(openai_translate, "translate_bulk", lambda *a, **kw: None)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(openai_translate, "translate_sentence", fake_sentence)
+
+    out = openai_translate.translate_batch(
+        ["a", "b"], BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=2,
+    )
+    assert [item.dst for item in out] == ["single:a", "single:b"]
+
+
+def test_translate_batch_caches_bulk_results(monkeypatch, tmp_path):
+    def fake_bulk(texts, source, meta, pre, *, client, model):
+        return {i: f"zh{i}" for i in range(1, len(texts) + 1)}
+
+    monkeypatch.setattr(openai_translate, "translate_bulk", fake_bulk)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        openai_translate, "translate_sentence", lambda *a, **kw: pytest.fail("should not run")
+    )
+
+    first = openai_translate.translate_batch(
+        ["a", "b"], BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=2, session=tmp_path,
+    )
+    assert [item.dst for item in first] == ["zh1", "zh2"]
+
+    # Second run is served entirely from the cache: no bulk request either.
+    monkeypatch.setattr(
+        openai_translate, "translate_bulk", lambda *a, **kw: pytest.fail("cache miss")
+    )
+    second = openai_translate.translate_batch(
+        ["a", "b"], BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=2, session=tmp_path,
+    )
+    assert [item.dst for item in second] == ["zh1", "zh2"]

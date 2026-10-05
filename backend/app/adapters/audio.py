@@ -47,6 +47,17 @@ def _load_audio(file: Path) -> tuple[np.ndarray, int]:
     return librosa.load(str(file), sr=None)
 
 
+def audio_duration_ms(file: Path) -> int | None:
+    """读取音频时长（毫秒）。只读文件头、不解码，失败返回 None。"""
+    try:
+        info = sf.info(str(file))
+        if not info.samplerate:
+            return None
+        return int(round(info.frames / info.samplerate * 1000))
+    except Exception:
+        return None
+
+
 def _resample(y: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
     if source_rate == target_rate:
         return y
