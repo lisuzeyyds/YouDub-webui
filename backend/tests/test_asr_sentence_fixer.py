@@ -149,14 +149,22 @@ def test_fix_asr_sentences_raises_when_all_are_outside_the_audio(tmp_path):
 
 def test_strip_trailing_repetition_drops_a_music_loop():
     """The real case: 8 identical lines ~29 s apart on the outro music."""
-    utts = [_utt("Real speech.", 0, 3000)]
+    utts = [
+        _utt("This is the real narration, running for a while.", 0, 3000),
+        _utt("It continues with a second sentence.", 3400, 6000),
+        _utt("And a third one before the music starts.", 6400, 9000),
+    ]
     for i in range(8):
         start = 588860 + i * 29000
         utts.append(_utt("Thank you.", start, start + 1400))
 
     kept, dropped = asr_sentence_fixer._strip_trailing_repetition(utts)
 
-    assert [u["text"] for u in kept] == ["Real speech."]
+    assert [u["text"] for u in kept] == [
+        "This is the real narration, running for a while.",
+        "It continues with a second sentence.",
+        "And a third one before the music starts.",
+    ]
     assert dropped == ["Thank you."] * 8
 
 
@@ -212,7 +220,10 @@ def test_strip_trailing_repetition_ignores_a_long_tail_line():
 
 def test_fix_asr_sentences_removes_outro_hallucination(tmp_path):
     duration = 100000
-    utts = [_utt("Real speech here.", 0, 3000)]
+    utts = [
+        _utt("This is the real narration and it runs for a while.", 0, 3000),
+        _utt("A second real sentence follows it closely.", 3400, 6000),
+    ]
     for i in range(5):
         start = 40000 + i * 10000
         utts.append(_utt("Thank you.", start, start + 1000))
@@ -221,4 +232,67 @@ def test_fix_asr_sentences_removes_outro_hallucination(tmp_path):
     fixed = asr_sentence_fixer.fix_asr_sentences(asr_file, session, start_pad=0, end_pad=0)
     out = json.loads(fixed.read_text(encoding="utf-8"))["result"]["utterances"]
 
-    assert [u["text"] for u in out] == ["Real speech here."]
+    assert [u["text"] for u in out] == [
+        "This is the real narration and it runs for a while.",
+        "A second real sentence follows it closely.",
+    ]
+
+
+def test_strip_trailing_repetition_keeps_the_closing_line():
+    """The real transcript ends with a distinctive closing line.
+
+    The scan reaches it (short, followed by the outro's silence); it must be
+    handed back because it does not repeat, unlike the loop after it.
+    """
+    utts = [
+        _utt("The narration explains the mod for a solid minute.", 0, 4000),
+        _utt("It keeps going with detailed technical context.", 4400, 9000),
+        _utt("Enough talk. Enjoy the fall.", 104280, 106400),
+    ]
+    for i in range(10):
+        start = 121160 + i * 30000
+        utts.append(_utt("Thank you.", start, start + 1000))
+
+    kept, dropped = asr_sentence_fixer._strip_trailing_repetition(utts)
+
+    assert kept[-1]["text"] == "Enough talk. Enjoy the fall."
+    assert len(dropped) == 10
+
+
+def test_strip_trailing_repetition_keeps_a_dense_burst_before_real_content():
+    """Back-to-back repeats inside the tail do not stop the scan."""
+    utts = [
+        _utt("Real narration line number one here.", 0, 3000),
+        _utt("Real narration line number two here.", 3400, 6000),
+    ]
+    # A burst of repeats packed together, then the sparse loop.
+    for i in range(4):
+        start = 12000 + i * 300
+        utts.append(_utt("Thank you.", start, start + 250))
+    for i in range(8):
+        start = 40000 + i * 30000
+        utts.append(_utt("Thank you.", start, start + 1000))
+
+    kept, dropped = asr_sentence_fixer._strip_trailing_repetition(utts)
+
+    assert [u["text"] for u in kept] == [
+        "Real narration line number one here.",
+        "Real narration line number two here.",
+    ]
+    assert len(dropped) == 12
+
+
+def test_strip_trailing_repetition_ignores_a_mixed_distinct_tail():
+    """Distinct short lines over the outro are not the repeated loop."""
+    utts = [
+        _utt("Real narration that runs for a while.", 0, 3000),
+        _utt("Another real narration sentence.", 3400, 6000),
+    ]
+    for i, text in enumerate(["Bye.", "See you.", "Take care.", "Good night.", "Later."]):
+        start = 40000 + i * 20000
+        utts.append(_utt(text, start, start + 800))
+
+    kept, dropped = asr_sentence_fixer._strip_trailing_repetition(utts)
+
+    assert kept == utts
+    assert dropped == []

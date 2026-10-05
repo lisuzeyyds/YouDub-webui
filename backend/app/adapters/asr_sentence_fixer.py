@@ -7,44 +7,100 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# Whisper loops on non-speech audio (outro music, room tone) and emits the same
-# short phrase over and over until the track ends, e.g. twelve identical
-# "Thank you." spanning 340 s with a rock-steady ~29 s spacing - the beat of the
-# music, not a human talking. Such a run is safe to drop: real repeated lines
-# sit close together, because speech is continuous.
+# Whisper loops on non-speech audio (outro music, room tone) and emits short
+# phrases until the track ends. Observed on an 812 s video: the real narration
+# stops at 106 s, then "Thank you." repeats 30+ times across the remaining
+# 700 s at a rock-steady ~29 s spacing - the beat of the music, not a human
+# talking. A single differing line ("You're welcome.") and a burst of
+# back-to-back repeats sit inside that tail, so the run cannot be found by
+# looking for one identical string, and walking back line by line stalls on the
+# dense burst.
+#
+# What reliably marks the tail is the long silence that precedes it: when the
+# narration stops, the outro music starts with several seconds of quiet, and
+# everything after that silence is short, isolated lines. So look for the last
+# long gap and drop the tail only when it is entirely made of short lines.
 _LOOP_MIN_RUN = 3
+_LOOP_MIN_REPEATS = 3
 _LOOP_MIN_GAP_MS = 8000
 _LOOP_MAX_TEXT_CHARS = 40
-_LOOP_TEXT_RE = re.compile(r"[^\w\u4e00-\u9fff]+")
+_LOOP_MIN_REPEAT_RATIO = 0.6
+_LOOP_PUNCT_RE = re.compile(r"[^\w\u4e00-\u9fff]+")
 
 
-def _loop_key(text: str) -> str:
-    return _LOOP_TEXT_RE.sub("", text).lower()
+def _normalize_key(text: str) -> str:
+    return _LOOP_PUNCT_RE.sub("", text).lower()
+
+
+def _is_short(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and len(stripped) <= _LOOP_MAX_TEXT_CHARS
 
 
 def _strip_trailing_repetition(utts: list) -> tuple[list, list]:
-    """Drop a trailing run of identical, widely-spaced short utterances.
+    """Drop a hallucinated tail of short, isolated lines over the outro.
 
-    Returns ``(kept, dropped_texts)``. Only the very end of the transcript is
-    examined, and a run must both repeat (>=3 identical lines) and be spread out
-    (average gap >= 8 s) before it is treated as hallucination.
+    Returns ``(kept, dropped_texts)``. Speech is continuous: consecutive real
+    utterances are separated by a breath at most. Hallucinations over music are
+    the opposite - brief lines scattered across a long stretch of silence. So
+    walk backwards from the end and keep extending the tail while the lines are
+    short and the running average spacing stays wide. A dense burst inside the
+    tail does not end the scan, because the wide spacing either side dominates
+    the average.
+
+    The scan can swallow the closing line of the real narration, which is also
+    short and followed by the outro's silence. Such a line is distinctive rather
+    than repetitive, so a run is only accepted when most of its lines repeat the
+    same text.
+
+    A run must be at least 3 lines long, and shorter than the whole transcript,
+    so an ordinary exchange is never touched.
     """
     if len(utts) < _LOOP_MIN_RUN:
         return utts, []
-    key = _loop_key(utts[-1].get("text", ""))
-    if not key or len(utts[-1].get("text", "")) > _LOOP_MAX_TEXT_CHARS:
+    if not _is_short(utts[-1].get("text", "")):
         return utts, []
+
     start = len(utts) - 1
-    while start > 0 and _loop_key(utts[start - 1].get("text", "")) == key:
+    gap_total = 0
+    gap_count = 0
+    while start > 0:
+        if not _is_short(utts[start - 1].get("text", "")):
+            break
+        gap = utts[start]["start_time"] - utts[start - 1]["end_time"]
+        gap_total += gap
+        gap_count += 1
+        if gap_total / gap_count < _LOOP_MIN_GAP_MS:
+            # The tail so far is spoken, not scattered: stop here.
+            break
         start -= 1
+
     run = utts[start:]
     if len(run) < _LOOP_MIN_RUN:
         return utts, []
-    gaps = [
-        run[i]["start_time"] - run[i - 1]["end_time"] for i in range(1, len(run))
-    ]
-    average_gap = sum(gaps) / len(gaps)
-    if average_gap < _LOOP_MIN_GAP_MS:
+    counts: dict[str, int] = {}
+    for item in run:
+        key = _normalize_key(item.get("text", ""))
+        counts[key] = counts.get(key, 0) + 1
+    repeated = max(counts.values(), default=0)
+    if repeated < _LOOP_MIN_REPEATS or repeated < len(run) * _LOOP_MIN_REPEAT_RATIO:
+        # Distinct lines scattered over the outro are not the Whisper loop, and
+        # two repeats are not enough to call it one.
+        return utts, []
+    if len(counts) == 1 and start == 0:
+        # The whole transcript is one repeated line: refuse to delete all of it.
+        return utts, []
+    # The scan can start on the closing line of the real narration, which is
+    # also short and followed by the outro's silence. Hand back the leading
+    # lines that do not repeat: a genuine closing line is distinctive, while the
+    # loop itself is the repeated text.
+    repeated_key = max(counts, key=lambda key: counts[key])
+    while start < len(utts) - _LOOP_MIN_RUN:
+        if _normalize_key(utts[start].get("text", "")) == repeated_key:
+            break
+        start += 1
+    run = utts[start:]
+    if len(run) < _LOOP_MIN_RUN:
         return utts, []
     return utts[:start], [u["text"] for u in run]
 
