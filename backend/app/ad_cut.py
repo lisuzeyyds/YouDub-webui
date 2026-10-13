@@ -40,6 +40,8 @@ AD_TAIL_PAD_MS = 220
 AD_MAX_SPANS = 40
 AD_MAX_TOTAL_RATIO = 0.4
 # A sentence squeezed below this by an overlapping cut is not worth keeping.
+# Only rows a cut actually ate into qualify: plenty of real lines ("No.",
+# "Yep.", "Four.") are naturally shorter than this, and they must survive.
 AD_MIN_KEPT_MS = 300
 
 
@@ -214,7 +216,9 @@ def apply_ad_cut(
                 continue
             new_start = remap_time(span[0], spans)
             new_end = remap_time(span[1], spans)
-            if new_end - new_start < AD_MIN_KEPT_MS:
+            original_ms = span[1] - span[0]
+            kept_ms = new_end - new_start
+            if kept_ms < AD_MIN_KEPT_MS and kept_ms < original_ms:
                 # The sentence sat entirely inside an ad break.
                 removed.append(_summary(item))
                 continue

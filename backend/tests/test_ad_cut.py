@@ -162,6 +162,33 @@ def test_apply_ad_cut_drops_a_real_row_swallowed_by_an_ad_break(tmp_path):
     assert [item["src"] for item in report.removed] == ["ad", "bleed"]
 
 
+def test_apply_ad_cut_keeps_short_rows_no_cut_touched(tmp_path):
+    """Naturally short lines survive; only time a cut ate into is expendable.
+
+    "No." (280ms), "Four." (80ms) and friends are ordinary dialogue. Treating
+    AD_MIN_KEPT_MS as a blanket minimum silently deleted forty of them from a
+    1068-line transcript, so the check must only fire when the cut shortened
+    the row.
+    """
+    session = tmp_path / "session"
+    translation = _write_translation(
+        session,
+        [
+            _line("No.", "不。", 30000, 30280),
+            _line("Four.", "四。", 40000, 40080),
+            _line("ad", "", 100000, 102000, is_ad=True),
+        ],
+    )
+
+    report = ad_cut.apply_ad_cut(translation, session, duration_ms=200000)
+
+    kept = _read_translation(translation)
+    assert [item["src"] for item in kept] == ["No.", "Four."]
+    assert [item["src"] for item in report.removed] == ["ad"]
+    # Untouched rows keep their original length on the output timeline.
+    assert kept[1]["out_end_time"] - kept[1]["out_start_time"] == 80
+
+
 def test_apply_ad_cut_abandons_the_video_cut_when_ads_cover_too_much(tmp_path):
     session = tmp_path / "session"
     translation = _write_translation(

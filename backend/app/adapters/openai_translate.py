@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from ..errors import DeterministicStageError
 from ..sources import SourceConfig
 from ._translate_prompts import (
+    BULK_COPY_PROMPT,
     BULK_TRANSLATION_PROMPT,
     CONTENT_ONLY_TRANSLATION_RULES,
     PREPROCESS_PROMPT,
@@ -45,8 +46,35 @@ DEFAULT_CONCURRENCY = 50
 # connections mid-batch. The trade-off is long outputs, which can be truncated,
 # so the reply protocol is one self-contained line per sentence and only the
 # lines that are actually missing get retried individually.
-BULK_MAX_CHARS = 12000
+#
+# The request is streamed (see ``_call_bulk``), which is what lets a payload this
+# large complete at all: the relay's gateway cuts any response whose body has not
+# started after ~100s, and a full transcript takes minutes to generate. A
+# payload past the cap is split into consecutive chunks rather than falling back
+# to one request per sentence, because 1068 sentences at ~27s each (concurrency
+# 2) is an hour while the same text in three streamed chunks is a few minutes.
+BULK_MAX_CHARS = 40000
 BULK_ATTEMPTS = 3
+# Share of a chunk a mid-stream drop must have delivered before the partial
+# reply is kept instead of retried; below it the chunk is cheap enough to redo.
+BULK_PARTIAL_MIN_RATIO = 0.25
+# Output budget. This is not a nicety: with no ``max_tokens`` the relay applies
+# its own (small) default, and a long reply then *ends cleanly* part-way through
+# - ``finish_reason='stop'`` with a third of the lines, no error, nothing to
+# retry. Measured on this relay: the same 542-line request stops after 95 lines
+# without the parameter and returns 513/513 in 210s with it.
+BULK_MAX_TOKENS = 16000
+# A long reply can still end early (stream cut, gateway hiccup). Asking again for
+# just the uncovered tail is one more request; handing the same leftovers to the
+# per-sentence path is 400+ requests and hours.
+BULK_TAIL_ROUNDS = 4
+# The upload copy (title/description/tags) comes back inside the whole-transcript
+# reply, but on a long transcript the model occasionally translates every line
+# and drops the header sections. The copy describes the *video*, so it is worth
+# one small extra request against an evenly sampled transcript rather than
+# shipping no title at all.
+COPY_CONDENSE_CHARS = 4000
+COPY_ATTEMPTS = 2
 _BULK_LINE_RE = re.compile(r"^\s*(\d+)\s*[\t:：.、]\s*(.*)$")
 
 # The whole-transcript request also returns the Bilibili metadata and the list of
@@ -79,6 +107,20 @@ class TranslationApiError(DeterministicStageError):
 
 class TransientApiError(RuntimeError):
     """A network-level hiccup that is worth retrying."""
+
+
+class PartialReplyError(TransientApiError):
+    """A streamed reply that died part-way through, carrying what it did send.
+
+    Retrying is the default, but a whole transcript takes minutes to stream and
+    a drop near the end would throw away almost all of it. The partial text
+    travels with the error so the caller can keep it when it already covers
+    enough of the transcript.
+    """
+
+    def __init__(self, message: str, partial: str) -> None:
+        super().__init__(message)
+        self.partial = partial
 
 
 class HotwordItem(BaseModel):
@@ -335,6 +377,89 @@ def _bulk_system(
     ).rstrip()
 
 
+def _bulk_copy_system(
+    meta: dict[str, Any],
+    source_url: str = "",
+) -> str:
+    return BULK_COPY_PROMPT.format(
+        source_title=str(meta.get("title") or "").strip() or "(unknown)",
+        source_uploader=str(meta.get("uploader") or "").strip() or "(unknown)",
+        source_url=source_url.strip() or "(unknown)",
+        payload="",
+    ).rstrip()
+
+
+def _condense(texts: list[str], budget: int = COPY_CONDENSE_CHARS) -> list[str]:
+    """Evenly sample ``texts`` down to roughly ``budget`` characters.
+
+    Both ends are always kept and the rest is spread evenly, so the sample
+    describes the whole video instead of truncating to the opening minutes.
+    """
+    if not texts:
+        return []
+    total = sum(len(text) + 1 for text in texts)
+    if total <= budget:
+        return list(texts)
+    keep = max(2, len(texts) * budget // total)
+    last = len(texts) - 1
+    while keep < len(texts):
+        step = last / (keep - 1)
+        indices = sorted({round(index * step) for index in range(keep)})
+        sampled = [texts[index] for index in indices]
+        if len(sampled) <= 2 or sum(len(text) + 1 for text in sampled) <= budget:
+            return sampled
+        keep = max(2, keep // 2)
+    return list(texts)
+
+
+def _copy_request(
+    texts: list[str],
+    system: str,
+    *,
+    client: OpenAI,
+    model: str,
+) -> BulkResult | None:
+    """One small request for the upload copy alone.
+
+    Used when the whole-transcript reply translated every line but omitted the
+    header sections; unlike :func:`_bulk_request` a reply with no translation
+    block is exactly what is wanted here, so only the copy sections are checked.
+    """
+    if not texts:
+        return None
+    payload = _bulk_payload(texts)
+    for attempt in range(COPY_ATTEMPTS):
+        try:
+            raw = _call_bulk(client, model, system, payload)
+        except TranslationApiError:
+            raise
+        except TransientApiError as exc:
+            log.warning(
+                "copy request transport failure (attempt %d/%d): %s",
+                attempt + 1,
+                COPY_ATTEMPTS,
+                exc,
+            )
+            if attempt < COPY_ATTEMPTS - 1:
+                time.sleep(_backoff(attempt))
+            continue
+        parsed = _parse_bulk(raw, len(texts))
+        if parsed.title or parsed.description:
+            log.info(
+                "copy request: title=%r, %d tag(s)",
+                parsed.title[:40],
+                len(parsed.tags),
+            )
+            return parsed
+        log.warning(
+            "copy request returned no usable copy (attempt %d/%d); raw[:200]=%r",
+            attempt + 1,
+            COPY_ATTEMPTS,
+            raw[:200],
+        )
+    return None
+
+
 def _split_bulk_sections(raw: str) -> dict[str, str]:
     """Split a reply on the ``#=== name ===`` headers into {name: body}.
 
@@ -452,65 +577,125 @@ def _coerce_bulk(value: Any) -> BulkResult | None:
     return None
 
 
-def _call_bulk(client: OpenAI, model: str, system: str, payload: str) -> str:
-    """One plain-text completion for the whole transcript."""
+def _open_bulk_stream(client: OpenAI, model: str, system: str, payload: str):
+    """Start the streamed whole-transcript completion with an explicit output cap.
+
+    ``max_tokens`` is set explicitly because leaving it out lets the relay decide,
+    and its default is small enough that a long reply simply stops in the middle
+    without an error (see ``BULK_MAX_TOKENS``). A relay that does not accept the
+    value (some reject anything above the model's own ceiling) is retried without
+    the parameter so the request still goes through - just with the old risk.
+    """
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": payload},
+    ]
     try:
-        response = client.chat.completions.create(
+        return client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": payload},
-            ],
+            messages=messages,
             temperature=0.2,
+            stream=True,
+            max_tokens=BULK_MAX_TOKENS,
         )
+    except APIStatusError as exc:
+        if _rejects_max_tokens(exc):
+            log.warning(
+                "relay rejected max_tokens=%d (%s); retrying without the cap",
+                BULK_MAX_TOKENS,
+                str(exc)[:120],
+            )
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                stream=True,
+            )
+        raise
+
+
+def _rejects_max_tokens(exc: APIStatusError) -> bool:
+    """True when a 4xx is the relay refusing the ``max_tokens`` value itself."""
+    status = getattr(exc, "status_code", None)
+    return status == 400 and "max_tokens" in str(exc).lower()
+
+
+def _call_bulk(client: OpenAI, model: str, system: str, payload: str) -> str:
+    """One plain-text completion for the whole transcript, read as a stream.
+
+    Streaming is not a nicety here, it is what makes the whole-transcript path
+    possible at all. A relay sitting behind Cloudflare (this one does) kills any
+    non-streamed request whose *first byte of body* takes longer than ~100s with
+    a 524, so a 26k-char transcript that needs ~4 minutes of generation could
+    never come back in one piece. Once the response is chunked the gateway sees
+    bytes immediately and the transfer is limited only by the model itself.
+
+    Measured on this relay: the same 1068-line transcript is a 524 at ~100s
+    without ``stream``, and completes all 1068 lines in 263s with it.
+    """
+    parts: list[str] = []
+    try:
+        stream = _open_bulk_stream(client, model, system, payload)
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if content:
+                parts.append(content)
     except (APIConnectionError, APITimeoutError) as exc:
-        raise TransientApiError(f"{type(exc).__name__}: {exc}") from exc
+        partial = "".join(parts)
+        message = f"{type(exc).__name__}: {exc}"
+        if partial:
+            raise PartialReplyError(message, partial) from exc
+        raise TransientApiError(message) from exc
     except APIStatusError as exc:
         status = getattr(exc, "status_code", None)
         if status in _TRANSIENT_STATUS or (isinstance(status, int) and status >= 500):
-            raise TransientApiError(f"HTTP {status}: {str(exc)[:200]}") from exc
+            partial = "".join(parts)
+            message = f"HTTP {status}: {str(exc)[:200]}"
+            if partial:
+                raise PartialReplyError(message, partial) from exc
+            raise TransientApiError(message) from exc
         raise TranslationApiError(_api_error_message(exc)) from exc
-    return response.choices[0].message.content or ""
+    return "".join(parts)
 
 
-def translate_bulk(
+def _chunk_by_payload(texts: list[str], max_chars: int) -> list[list[str]]:
+    """Greedy split of ``texts`` into consecutive groups that fit ``max_chars``.
+
+    Sizes are measured on the numbered payload the model actually receives
+    (``"<n>\\t<text>"``), because that is what the cap protects, and numbering
+    restarts inside every chunk. A single sentence longer than the cap still gets
+    a chunk of its own rather than being dropped.
+    """
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for text in texts:
+        line_len = len(text) + len(str(len(current) + 1)) + 2
+        if current and size + line_len > max_chars:
+            chunks.append(current)
+            current = []
+            size = 0
+            line_len = len(text) + 2
+        current.append(text)
+        size += line_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _bulk_request(
     texts: list[str],
-    source: SourceConfig,
-    meta: dict[str, Any],
-    pre: PreprocessResponse,
+    system: str,
     *,
     client: OpenAI,
     model: str,
-    source_url: str = "",
 ) -> BulkResult | None:
-    """Ask for everything in a single request.
-
-    One request means the model sees every sentence together (consistent
-    terminology, names and tone) and there is no concurrency to drop
-    connections. It also lets the same call judge which lines are ads and write
-    the Bilibili title/description, because those judgements need the same
-    whole-video context.
-
-    The cost is a long reply that can be truncated, which the numbered-line
-    protocol absorbs: the metadata and ad list are emitted *before* the
-    translation block, so a cut-off reply still carries them, and every line it
-    did contain survives.
-
-    Returns a :class:`BulkResult`, or ``None`` when the bulk request cannot be
-    served (too long / endpoint refused / unusable reply), so the caller falls
-    back to per-sentence translation.
-    """
-    if not texts:
-        return BulkResult()
+    """Run one streamed whole-transcript request; ``None`` when it is unusable."""
     payload = _bulk_payload(texts)
-    if len(payload) > BULK_MAX_CHARS:
-        log.info(
-            "bulk translate skipped: payload %d chars exceeds %d",
-            len(payload),
-            BULK_MAX_CHARS,
-        )
-        return None
-    system = _bulk_system(source, meta, pre, source_url)
     last_error: Exception | None = None
     for attempt in range(BULK_ATTEMPTS):
         try:
@@ -519,12 +704,27 @@ def translate_bulk(
             raise
         except TransientApiError as exc:
             last_error = exc
+            partial = getattr(exc, "partial", "")
             log.warning(
-                "bulk translate transport failure (attempt %d/%d): %s",
+                "bulk translate stream failed (attempt %d/%d) after %d char(s): %s",
                 attempt + 1,
                 BULK_ATTEMPTS,
+                len(partial),
                 exc,
             )
+            if partial:
+                parsed = _parse_bulk(partial, len(texts))
+                # A whole-transcript reply takes minutes to stream, so a drop
+                # near the end must not discard it: keep what arrived once it
+                # covers enough of the chunk, and let the caller top up the rest
+                # sentence by sentence.
+                if len(parsed.lines) >= max(1, int(len(texts) * BULK_PARTIAL_MIN_RATIO)):
+                    log.warning(
+                        "bulk translate keeping the partial stream: %d/%d lines",
+                        len(parsed.lines),
+                        len(texts),
+                    )
+                    return parsed
             if attempt < BULK_ATTEMPTS - 1:
                 time.sleep(_backoff(attempt))
             continue
@@ -546,6 +746,134 @@ def translate_bulk(
         )
     log.warning("bulk translate gave up after %d attempts: %s", BULK_ATTEMPTS, last_error)
     return None
+
+
+def _bulk_request_chunk(
+    texts: list[str],
+    system: str,
+    *,
+    client: OpenAI,
+    model: str,
+) -> BulkResult | None:
+    """Serve one chunk, re-asking only for whatever the replies left out.
+
+    A long reply can end before its last line - the relay stops the stream, or the
+    model just stops. Everything it did deliver is kept, and the uncovered tail is
+    requested again: the tail is a suffix, so line numbers stay comparable and each
+    round covers more of a shrinking remainder. Without this the leftovers go to
+    the per-sentence path, which is the difference between one more request and a
+    few hundred.
+    """
+    if not texts:
+        return BulkResult()
+    merged = BulkResult()
+    answered: set[int] = set()
+    rounds = 0
+    while rounds < BULK_TAIL_ROUNDS:
+        remaining = [text for number, text in enumerate(texts, start=1) if number not in answered]
+        if not remaining:
+            break
+        reply = _bulk_request(remaining, system, client=client, model=model)
+        if reply is None:
+            break
+        base = len(texts) - len(remaining)
+        gained = 0
+        # Ads first: an ad line keeps no target text, and a reply that lists it in
+        # both the ad block and the translation block must not be recorded as a
+        # normal line (the downstream stage would then dub what it is cutting).
+        for number in reply.ad_lines:
+            position = base + number
+            if position not in answered:
+                answered.add(position)
+                merged.ad_lines.add(position)
+                gained += 1
+        for number, text in reply.lines.items():
+            position = base + number
+            if position not in answered:
+                answered.add(position)
+                merged.lines[position] = text
+                gained += 1
+        if not merged.title:
+            merged.title = reply.title
+        if not merged.description:
+            merged.description = reply.description
+        if not merged.tags:
+            merged.tags = list(reply.tags)
+        rounds += 1
+        if not gained:
+            break
+        if rounds > 1:
+            log.info(
+                "bulk translate continued for the missing tail: %d line(s) still open",
+                len(texts) - len(answered),
+            )
+    if not (merged.lines or merged.ad_lines):
+        return None
+    return merged
+
+
+def translate_bulk(
+    texts: list[str],
+    source: SourceConfig,
+    meta: dict[str, Any],
+    pre: PreprocessResponse,
+    *,
+    client: OpenAI,
+    model: str,
+    source_url: str = "",
+) -> BulkResult | None:
+    """Ask for everything in as few requests as the payload cap allows.
+
+    One request means the model sees every sentence together (consistent
+    terminology, names and tone) and there is no concurrency to drop
+    connections. It also lets the same call judge which lines are ads and write
+    the Bilibili title/description, because those judgements need the same
+    whole-video context.
+
+    The cost is a long reply that can be truncated, which the numbered-line
+    protocol absorbs: the metadata and ad list are emitted *before* the
+    translation block, so a cut-off reply still carries them, and every line it
+    did contain survives.
+
+    A transcript past the cap is cut into consecutive chunks that are requested
+    one after another and merged, not abandoned to per-sentence translation: the
+    fan-out is what turns a five-minute stage into an hour, and the chunks still
+    share the video-level ``meta`` that the copy is written from. Only when a
+    chunk comes back empty do its own lines fall through to the caller's
+    per-sentence path.
+
+    Returns a :class:`BulkResult`, or ``None`` when no request could be served.
+    """
+    if not texts:
+        return BulkResult()
+    system = _bulk_system(source, meta, pre, source_url)
+    chunks = _chunk_by_payload(texts, BULK_MAX_CHARS)
+    if len(chunks) > 1:
+        log.info(
+            "bulk translate: %d sentences split into %d chunk(s) of <=%d chars",
+            len(texts),
+            len(chunks),
+            BULK_MAX_CHARS,
+        )
+    merged = BulkResult()
+    offset = 0
+    served = False
+    for chunk in chunks:
+        result = _bulk_request_chunk(chunk, system, client=client, model=model)
+        if result is not None:
+            served = True
+            for number, text in result.lines.items():
+                merged.lines[offset + number] = text
+            for number in result.ad_lines:
+                merged.ad_lines.add(offset + number)
+            if not merged.title:
+                merged.title = result.title
+            if not merged.description:
+                merged.description = result.description
+            if not merged.tags:
+                merged.tags = list(result.tags)
+        offset += len(chunk)
+    return merged if served else None
 
 
 def _fix_translation_item(dst: str) -> TranslationItem:
@@ -761,6 +1089,28 @@ def translate_batch(
             )
         )
         if bulk is not None:
+            if not (bulk.title or bulk.description):
+                # A long transcript sometimes makes the model translate every
+                # line and silently drop the header sections. The copy is about
+                # the whole video, so ask for it directly instead of shipping an
+                # upload with no title. This is enrichment on top of a finished
+                # translation, so a failure here must never fail the stage.
+                try:
+                    fallback = _copy_request(
+                        _condense(bulk_input),
+                        _bulk_copy_system(meta, source_url),
+                        client=client,
+                        model=model,
+                    )
+                except TranslationApiError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - copy is best-effort
+                    log.warning("copy fallback failed, shipping without it: %s", exc)
+                    fallback = None
+                if fallback is not None:
+                    bulk.title = fallback.title
+                    bulk.description = fallback.description
+                    bulk.tags = list(fallback.tags)
             if meta_out is not None:
                 meta_out["title"] = bulk.title
                 meta_out["description"] = bulk.description

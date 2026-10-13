@@ -221,6 +221,52 @@ BULK_TRANSLATION_PROMPT = """{system}
 """
 
 
+BULK_COPY_PROMPT = """# 任务（覆盖下面的翻译规则）
+这一次**只写 B 站投稿元信息**，不需要翻译任何句子，也不要输出逐行译文。
+
+# 原视频信息（写简介时必须使用）
+原标题：{source_title}
+原作者：{source_uploader}
+原视频链接：{source_url}
+
+# 字幕抽样
+下面是这条视频字幕的等间隔抽样。行号不代表连续顺序，只用来了解**整条视频**讲了什么，
+不要只根据开头或结尾判断。
+
+# 要求
+按顶级 UP 主投稿水准来写，不要写成机器摘要。
+
+标题：
+- 18-30 个中文字符，把最有钩子的信息放最前面，可用「」或（）补充副信息。
+- 保留关键人名、品牌、作品名、技术名词的原文写法。
+- 有信息增量、有情绪张力，但不夸大失真，不用「震惊」「必看」这类空话，不要放 # 话题。
+
+简介：
+- 4-7 行、约 150-260 字，逐行写，行与行之间用换行分隔。
+- 开头 1-2 行说清这条视频讲什么、为什么值得看；中间 2-3 行点出看点、关键结论或适合谁看；
+  可以自然带出视频里出现的专名。
+- 结尾必须单独一行声明来源，格式固定为：`原视频：{source_url}`，这一行必须逐字包含上面的链接。
+- 最后单独一行放 3-5 个话题标签，写成 `#标签 #标签` 的形式。
+
+标签：5-10 个中文短标签，逗号分隔，覆盖领域、主题与该视频的关键概念。
+
+# 输出格式（极其重要）
+严格按下面的分节输出，节标题必须一字不差、独占一行，**只输出这三节**，不要输出译文块：
+
+#=== 标题 ===
+<B 站标题>
+
+#=== 简介 ===
+<B 站简介>
+
+#=== 标签 ===
+<标签1, 标签2, 标签3>
+
+# 输入
+{payload}
+"""
+
+
 CONTENT_ONLY_TRANSLATION_RULES = """# Content-only translation priority (highest priority; overrides earlier filler guidance)
 Translate the proposition, facts, requests, and meaningful emotion in each utterance. Do not translate or add standalone discourse fillers, hesitation sounds, acknowledgements, or sentence-ending particles when they carry no information. Examples include English "um", "uh", filler "well", "you know", "like", or "so"; and Chinese "嗯", "啊", "哦", "呢", "吧", or "啦" when they are only modal particles.
 
