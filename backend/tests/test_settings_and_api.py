@@ -2034,3 +2034,64 @@ def test_delete_local_video_removes_upload(monkeypatch, tmp_path):
     assert response.status_code == 204
     assert not upload_root.exists()
     assert database.get_task(task_id) is None
+
+
+def test_task_detail_surfaces_the_upload_copy_and_the_ad_cut(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=adcut1", task_id="adcut1"
+    )
+    session = config.WORKFOLDER / "Some_Video__adcut1"
+    metadata = session / "metadata"
+    metadata.mkdir(parents=True)
+    (metadata / "bilibili_meta.json").write_text(
+        json.dumps(
+            {
+                "title": "好标题",
+                "description": "原视频：https://youtu.be/x",
+                "tags": ["标签a", "标签b"],
+                "source_url": "https://youtu.be/x",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (metadata / "ad_cut.json").write_text(
+        json.dumps(
+            {
+                "spans": [[1000, 2000]],
+                "removed": [{"src": "买我的课", "start_time": 1000, "end_time": 2000}],
+                "duration_ms": 10000,
+                "cut_ms": 1000,
+                "output_duration_ms": 9000,
+                "skipped_reason": "",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    database.update_task(task_id, status="succeeded", session_path=str(session))
+
+    response = authenticated_client().get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["bilibili"]["title"] == "好标题"
+    assert body["bilibili"]["tags"] == ["标签a", "标签b"]
+    assert body["ad_cut"]["spans"] == [[1000, 2000]]
+    assert body["ad_cut"]["cut_ms"] == 1000
+    assert body["ad_cut"]["removed"][0]["src"] == "买我的课"
+    # The rest of the task payload is untouched.
+    assert body["id"] == task_id
+
+
+def test_task_detail_omits_the_new_fields_while_there_is_no_session(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=nosession1", task_id="nosession1"
+    )
+
+    body = authenticated_client().get(f"/api/tasks/{task_id}").json()
+
+    assert "bilibili" not in body
+    assert "ad_cut" not in body
