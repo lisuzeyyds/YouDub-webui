@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterable, Literal, Sequence
 
 from openai import (
     APIConnectionError,
@@ -87,6 +87,8 @@ BULK_SECTION_DESC = "简介"
 BULK_SECTION_TAGS = "标签"
 BULK_SECTION_ADS = "广告行号"
 BULK_SECTION_LINES = "逐行译文"
+BULK_SECTION_ZONE = "建议分区"
+BULK_SECTION_COLLECTION = "建议合集"
 _AD_RANGE_RE = re.compile(r"(\d+)\s*[-~—－–至]\s*(\d+)")
 _AD_NUM_RE = re.compile(r"\d+")
 _AD_NONE_VALUES = {"", "-", "无", "没有", "none", "null", "n/a", "na", "[]", "（）", "()"}
@@ -160,6 +162,8 @@ class BulkResult:
     title: str = ""
     description: str = ""
     tags: list[str] = field(default_factory=list)
+    zone: str = ""
+    collection: str = ""
 
     def merged_ad_lines(self, expected: int) -> set[int]:
         """Ad indexes from the explicit list, plus any line marked ``[AD]``.
@@ -362,17 +366,28 @@ def _bulk_payload(texts: list[str]) -> str:
     return "\n".join(f"{index}\t{text}" for index, text in enumerate(texts, start=1))
 
 
+def _format_options(options: Iterable[str], fallback: str) -> str:
+    """Render a choice list for the prompt (``A / B / C``)."""
+    wanted = [str(option).strip() for option in options if str(option).strip()]
+    return " / ".join(wanted) if wanted else fallback
+
+
 def _bulk_system(
     source: SourceConfig,
     meta: dict[str, Any],
     pre: PreprocessResponse,
     source_url: str = "",
+    *,
+    zone_options: Iterable[str] = (),
+    collection_options: Iterable[str] = (),
 ) -> str:
     return BULK_TRANSLATION_PROMPT.format(
         system=_translate_system(source, meta, pre),
         source_title=str(meta.get("title") or "").strip() or "(unknown)",
         source_uploader=str(meta.get("uploader") or "").strip() or "(unknown)",
         source_url=source_url.strip() or "(unknown)",
+        zone_options=_format_options(zone_options, "(未提供，写「无」)"),
+        collection_options=_format_options(collection_options, "(未提供，写「无」)"),
         payload="",
     ).rstrip()
 
@@ -380,11 +395,16 @@ def _bulk_system(
 def _bulk_copy_system(
     meta: dict[str, Any],
     source_url: str = "",
+    *,
+    zone_options: Iterable[str] = (),
+    collection_options: Iterable[str] = (),
 ) -> str:
     return BULK_COPY_PROMPT.format(
         source_title=str(meta.get("title") or "").strip() or "(unknown)",
         source_uploader=str(meta.get("uploader") or "").strip() or "(unknown)",
         source_url=source_url.strip() or "(unknown)",
+        zone_options=_format_options(zone_options, "(未提供，写「无」)"),
+        collection_options=_format_options(collection_options, "(未提供，写「无」)"),
         payload="",
     ).rstrip()
 
@@ -418,6 +438,8 @@ def _copy_request(
     *,
     client: OpenAI,
     model: str,
+    zone_options: Sequence[str] = (),
+    collection_options: Sequence[str] = (),
 ) -> BulkResult | None:
     """One small request for the upload copy alone.
 
@@ -443,12 +465,19 @@ def _copy_request(
             if attempt < COPY_ATTEMPTS - 1:
                 time.sleep(_backoff(attempt))
             continue
-        parsed = _parse_bulk(raw, len(texts))
+        parsed = _parse_bulk(
+            raw,
+            len(texts),
+            zone_options=zone_options,
+            collection_options=collection_options,
+        )
         if parsed.title or parsed.description:
             log.info(
-                "copy request: title=%r, %d tag(s)",
+                "copy request: title=%r, %d tag(s), zone=%r, collection=%r",
                 parsed.title[:40],
                 len(parsed.tags),
+                parsed.zone,
+                parsed.collection,
             )
             return parsed
         log.warning(
@@ -536,6 +565,42 @@ def _parse_tags(text: str) -> list[str]:
     return tags
 
 
+def _parse_choice(text: str, options: Iterable[str], *, none_values: tuple[str, ...] = ()) -> str:
+    """Reduce a free-form model answer to one entry of ``options``.
+
+    The prompt restricts the model to a fixed list, but replies still arrive
+    with a label, a parenthesised reason or a trailing period. Matching is
+    forgiving (exact, then containment, then case-insensitive) and falls back
+    to the empty string so the caller can keep the page default instead of
+    typing something the upload page will reject.
+    """
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return ""
+    first_line = cleaned.splitlines()[0].strip()
+    first_line = re.sub(r"^[#*\-\s]*", "", first_line)
+    first_line = re.sub(r"^[^：:]{0,12}[：:]\s*", "", first_line)
+    first_line = first_line.strip("。.、,，;；")
+    first_line = re.sub(r"[（(].*?[)）]", "", first_line).strip()
+    if not first_line:
+        return ""
+    compact = re.sub(r"\s+", "", first_line).lower()
+    if compact in {re.sub(r"\s+", "", value).lower() for value in none_values}:
+        return ""
+
+    wanted = [value for value in options if value and value.strip()]
+    for value in wanted:
+        if first_line == value:
+            return value
+    for value in wanted:
+        if re.sub(r"\s+", "", value).lower() == compact:
+            return value
+    for value in wanted:
+        if value in first_line or first_line in value:
+            return value
+    return ""
+
+
 def _parse_bulk_reply(raw: str, expected: int) -> dict[int, str]:
     """Map line number -> translation for a whole-transcript reply.
 
@@ -554,7 +619,13 @@ def _parse_bulk_reply(raw: str, expected: int) -> dict[int, str]:
     return result
 
 
-def _parse_bulk(raw: str, expected: int) -> BulkResult:
+def _parse_bulk(
+    raw: str,
+    expected: int,
+    *,
+    zone_options: Sequence[str] = (),
+    collection_options: Sequence[str] = (),
+) -> BulkResult:
     """Parse a whole-transcript reply into translations + metadata + ad lines."""
     sections = _split_bulk_sections(raw)
     return BulkResult(
@@ -563,6 +634,12 @@ def _parse_bulk(raw: str, expected: int) -> BulkResult:
         title=sections.get(BULK_SECTION_TITLE, "").strip(),
         description=sections.get(BULK_SECTION_DESC, "").strip(),
         tags=_parse_tags(sections.get(BULK_SECTION_TAGS, "")),
+        zone=_parse_choice(sections.get(BULK_SECTION_ZONE, ""), zone_options),
+        collection=_parse_choice(
+            sections.get(BULK_SECTION_COLLECTION, ""),
+            collection_options,
+            none_values=("无", "none", "n/a", "不适用", "没有"),
+        ),
     )
 
 
@@ -693,9 +770,15 @@ def _bulk_request(
     *,
     client: OpenAI,
     model: str,
+    zone_options: Sequence[str] = (),
+    collection_options: Sequence[str] = (),
 ) -> BulkResult | None:
     """Run one streamed whole-transcript request; ``None`` when it is unusable."""
     payload = _bulk_payload(texts)
+    parse_kwargs = {
+        "zone_options": zone_options,
+        "collection_options": collection_options,
+    }
     last_error: Exception | None = None
     for attempt in range(BULK_ATTEMPTS):
         try:
@@ -713,7 +796,7 @@ def _bulk_request(
                 exc,
             )
             if partial:
-                parsed = _parse_bulk(partial, len(texts))
+                parsed = _parse_bulk(partial, len(texts), **parse_kwargs)
                 # A whole-transcript reply takes minutes to stream, so a drop
                 # near the end must not discard it: keep what arrived once it
                 # covers enough of the chunk, and let the caller top up the rest
@@ -728,7 +811,7 @@ def _bulk_request(
             if attempt < BULK_ATTEMPTS - 1:
                 time.sleep(_backoff(attempt))
             continue
-        parsed = _parse_bulk(raw, len(texts))
+        parsed = _parse_bulk(raw, len(texts), **parse_kwargs)
         if parsed.lines or parsed.ad_lines:
             log.info(
                 "bulk translate: %d/%d lines, %d ad line(s), title=%r",
@@ -754,6 +837,8 @@ def _bulk_request_chunk(
     *,
     client: OpenAI,
     model: str,
+    zone_options: Sequence[str] = (),
+    collection_options: Sequence[str] = (),
 ) -> BulkResult | None:
     """Serve one chunk, re-asking only for whatever the replies left out.
 
@@ -773,7 +858,14 @@ def _bulk_request_chunk(
         remaining = [text for number, text in enumerate(texts, start=1) if number not in answered]
         if not remaining:
             break
-        reply = _bulk_request(remaining, system, client=client, model=model)
+        reply = _bulk_request(
+            remaining,
+            system,
+            client=client,
+            model=model,
+            zone_options=zone_options,
+            collection_options=collection_options,
+        )
         if reply is None:
             break
         base = len(texts) - len(remaining)
@@ -799,6 +891,10 @@ def _bulk_request_chunk(
             merged.description = reply.description
         if not merged.tags:
             merged.tags = list(reply.tags)
+        if not merged.zone:
+            merged.zone = reply.zone
+        if not merged.collection:
+            merged.collection = reply.collection
         rounds += 1
         if not gained:
             break
@@ -821,6 +917,8 @@ def translate_bulk(
     client: OpenAI,
     model: str,
     source_url: str = "",
+    zone_options: Sequence[str] = (),
+    collection_options: Sequence[str] = (),
 ) -> BulkResult | None:
     """Ask for everything in as few requests as the payload cap allows.
 
@@ -846,7 +944,14 @@ def translate_bulk(
     """
     if not texts:
         return BulkResult()
-    system = _bulk_system(source, meta, pre, source_url)
+    system = _bulk_system(
+        source,
+        meta,
+        pre,
+        source_url,
+        zone_options=zone_options,
+        collection_options=collection_options,
+    )
     chunks = _chunk_by_payload(texts, BULK_MAX_CHARS)
     if len(chunks) > 1:
         log.info(
@@ -859,7 +964,14 @@ def translate_bulk(
     offset = 0
     served = False
     for chunk in chunks:
-        result = _bulk_request_chunk(chunk, system, client=client, model=model)
+        result = _bulk_request_chunk(
+            chunk,
+            system,
+            client=client,
+            model=model,
+            zone_options=zone_options,
+            collection_options=collection_options,
+        )
         if result is not None:
             served = True
             for number, text in result.lines.items():
@@ -872,6 +984,10 @@ def translate_bulk(
                 merged.description = result.description
             if not merged.tags:
                 merged.tags = list(result.tags)
+            if not merged.zone:
+                merged.zone = result.zone
+            if not merged.collection:
+                merged.collection = result.collection
         offset += len(chunk)
     return merged if served else None
 
@@ -1022,6 +1138,8 @@ def translate_batch(
     session: Path | None = None,
     source_url: str = "",
     meta_out: dict[str, Any] | None = None,
+    zone_options: Sequence[str] = (),
+    collection_options: Sequence[str] = (),
 ) -> list[TranslationItem]:
     if not texts:
         return []
@@ -1086,6 +1204,8 @@ def translate_batch(
                 client=client,
                 model=model,
                 source_url=source_url,
+                zone_options=zone_options,
+                collection_options=collection_options,
             )
         )
         if bulk is not None:
@@ -1098,9 +1218,16 @@ def translate_batch(
                 try:
                     fallback = _copy_request(
                         _condense(bulk_input),
-                        _bulk_copy_system(meta, source_url),
+                        _bulk_copy_system(
+                            meta,
+                            source_url,
+                            zone_options=zone_options,
+                            collection_options=collection_options,
+                        ),
                         client=client,
                         model=model,
+                        zone_options=zone_options,
+                        collection_options=collection_options,
                     )
                 except TranslationApiError:
                     raise
@@ -1111,10 +1238,16 @@ def translate_batch(
                     bulk.title = fallback.title
                     bulk.description = fallback.description
                     bulk.tags = list(fallback.tags)
+                    if not bulk.zone:
+                        bulk.zone = fallback.zone
+                    if not bulk.collection:
+                        bulk.collection = fallback.collection
             if meta_out is not None:
                 meta_out["title"] = bulk.title
                 meta_out["description"] = bulk.description
                 meta_out["tags"] = list(bulk.tags)
+                meta_out["zone"] = bulk.zone
+                meta_out["collection"] = bulk.collection
             ad_positions = bulk.merged_ad_lines(len(bulk_input))
             if ad_positions:
                 log.info(
@@ -1237,6 +1370,8 @@ def write_bilibili_meta(
     description: str = "",
     tags: list[str] | None = None,
     source_url: str = "",
+    zone: str = "",
+    collection: str = "",
 ) -> Path | None:
     """Persist the upload copy for the Bilibili release.
 
@@ -1260,6 +1395,8 @@ def write_bilibili_meta(
                 "description": description,
                 "tags": list(tags or []),
                 "source_url": link,
+                "zone": (zone or "").strip(),
+                "collection": (collection or "").strip(),
             },
             ensure_ascii=False,
             indent=2,
@@ -1276,6 +1413,8 @@ def translate_asr(
     source: SourceConfig,
     *,
     source_url: str = "",
+    zone_options: Sequence[str] = (),
+    collection_options: Sequence[str] = (),
 ) -> Path:
     output_file = session / "metadata" / f"translation.{source.target_language}.json"
     if output_file.exists():
@@ -1307,6 +1446,8 @@ def translate_asr(
         session=session,
         source_url=link,
         meta_out=meta_out,
+        zone_options=zone_options,
+        collection_options=collection_options,
     )
     if meta_out.get("title") or meta_out.get("description"):
         written = write_bilibili_meta(
@@ -1315,6 +1456,8 @@ def translate_asr(
             description=meta_out.get("description", ""),
             tags=meta_out.get("tags") or [],
             source_url=link,
+            zone=meta_out.get("zone", ""),
+            collection=meta_out.get("collection", ""),
         )
         if written is not None:
             log.info("Wrote Bilibili upload copy to %s", written)

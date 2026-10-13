@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, SecretStr
 
 from . import ad_cut, auth, database, runtime_security, worker, worker_selfheal
+from .adapters.bilibili import load_publish_result
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_client import validate_openai_base_url
@@ -70,6 +71,7 @@ class TaskCreate(BaseModel):
     url: str
     execution_mode: str = "auto"
     output_mode: str = "both"
+    auto_publish: bool = False
 
 
 class ContinueTaskRequest(BaseModel):
@@ -95,6 +97,16 @@ class OpenAIModelsRequest(BaseModel):
 
 class YtdlpSettingsUpdate(BaseModel):
     proxy_port: str = ""
+
+
+class BilibiliSettingsUpdate(BaseModel):
+    zones: str = ""
+    collections: str = ""
+    declare: str = ""
+    chrome_path: str = ""
+    profile_dir: str = ""
+    node_path: str = ""
+    script_path: str = ""
 
 
 class LoginRequest(BaseModel):
@@ -364,6 +376,7 @@ def create_task(payload: TaskCreate) -> dict:
         validated_url.video_id,
         execution_mode=normalized_execution_mode,
         output_mode=normalized_output_mode,
+        auto_publish=payload.auto_publish,
     )
     task = database.get_task(task_id)
     if task is None:
@@ -446,6 +459,7 @@ def upload_local_video(
     subtitle_file: UploadFile | None = File(None),
     execution_mode: str = Form("auto"),
     output_mode: str = Form("both"),
+    auto_publish: bool = Form(False),
 ) -> dict:
     if direction not in LOCAL_UPLOAD_DIRECTIONS:
         raise HTTPException(status_code=422, detail="Unsupported local video direction.")
@@ -483,6 +497,7 @@ def upload_local_video(
             task_id=task_id,
             execution_mode=normalized_execution_mode,
             output_mode=normalized_output_mode,
+            auto_publish=auto_publish,
         )
         database.update_task(task_id, title=Path(original_name).stem)
         task = database.get_task(task_id)
@@ -538,6 +553,9 @@ def _with_upload_copy(task: dict) -> dict:
     plan = ad_cut.load_cut_plan(session)
     if plan:
         extra["ad_cut"] = plan
+    published = load_publish_result(session)
+    if published:
+        extra["publish"] = published
     return {**task, **extra} if extra else task
 
 
@@ -773,3 +791,21 @@ def get_ytdlp_settings() -> dict:
 def save_ytdlp_settings(payload: YtdlpSettingsUpdate) -> dict:
     database.save_ytdlp_settings(normalize_proxy_port(payload.proxy_port))
     return get_ytdlp_settings()
+
+
+@app.get("/api/settings/bilibili")
+def get_bilibili_settings() -> dict:
+    settings = database.get_bilibili_settings()
+    return {
+        **settings,
+        "zone_list": database.bilibili_option_list(settings["zones"]),
+        "collection_list": database.bilibili_option_list(settings["collections"]),
+    }
+
+
+@app.post("/api/settings/bilibili")
+def save_bilibili_settings(payload: BilibiliSettingsUpdate) -> dict:
+    # Only the fields the caller actually sent are touched, so a partial save
+    # from the settings form cannot wipe the tool paths.
+    database.save_bilibili_settings(payload.model_dump(exclude_unset=True))
+    return get_bilibili_settings()

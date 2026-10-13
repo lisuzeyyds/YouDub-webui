@@ -63,6 +63,8 @@ def test_health_and_login_are_public(client):
         ("POST", "/api/settings/openai/models"),
         ("GET", "/api/settings/ytdlp"),
         ("POST", "/api/settings/ytdlp"),
+        ("GET", "/api/settings/bilibili"),
+        ("POST", "/api/settings/bilibili"),
     ],
 )
 def test_every_api_route_requires_authentication(client, method, path):

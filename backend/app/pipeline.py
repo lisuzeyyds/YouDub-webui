@@ -27,7 +27,7 @@ from .devices import device_plan_summary
 from .errors import DeterministicStageError
 from .runtime_checks import validate_runtime_device
 from .sources import SourceConfig, detect_source
-from .stages import STAGES
+from .stages import STAGE_NAMES, STAGES
 from .youtube import is_local_upload_url
 
 # Stages whose failures can be caused by the worker being unable to spawn
@@ -121,6 +121,7 @@ class PipelineRunner:
             "tts": self._tts,
             "merge_audio": self._merge_audio,
             "merge_video": self._merge_video,
+            "publish": self._publish,
         }
 
     def run(self) -> None:
@@ -164,7 +165,9 @@ class PipelineRunner:
                     self._skip_stage(stage.name, output_mode)
                     continue
                 self._run_stage(stage.name)
-                if execution_mode == "manual" and stage != STAGES[-1]:
+                if execution_mode == "manual" and self._has_pending_stage_after(
+                    stage.name, output_mode, database.get_task(self.task_id)
+                ):
                     database.update_task(self.task_id, status="paused")
                     self.log(f"Paused after [{stage.name}], waiting for manual continue")
                     return
@@ -255,16 +258,39 @@ class PipelineRunner:
     def _should_skip_stage(self, stage: str, output_mode: str, task: dict | None) -> bool:
         if output_mode == "subtitles" and stage in {"split_audio", "tts", "merge_audio"}:
             return True
-        return (
+        if (
             output_mode == "subtitles"
             and stage == "separate"
             and task is not None
             and self._uploaded_subtitle_path(task) is not None
-        )
+        ):
+            return True
+        # Publishing is opt-in per task: an unrequested upload must never leave
+        # the machine, so the stage is skipped unless the task asked for it.
+        return stage == "publish" and not (task or {}).get("auto_publish")
+
+    def _has_pending_stage_after(self, stage: str, output_mode: str, task: dict | None) -> bool:
+        """Whether manual mode should pause once ``stage`` has finished.
+
+        Stages that will be skipped, or that are already cached, are not work
+        the user has to approve - pausing on them would ask for a click that
+        does nothing.
+        """
+        index = STAGE_NAMES.index(stage)
+        for later in STAGES[index + 1 :]:
+            if self._should_skip_stage(later.name, output_mode, task):
+                continue
+            if self._stage_status(later.name) != "succeeded":
+                return True
+        return False
 
     def _skip_stage(self, stage: str, output_mode: str) -> None:
         completed_at = database.now_iso()
-        message = f"Skipped for output mode: {output_mode}"
+        message = (
+            "Skipped: this task did not ask for an automatic upload"
+            if stage == "publish"
+            else f"Skipped for output mode: {output_mode}"
+        )
         database.update_task(self.task_id, current_stage=stage)
         database.update_stage(
             self.task_id,
@@ -310,7 +336,10 @@ class PipelineRunner:
 
     def _run_stage(self, stage: str) -> None:
         self._progress_state.pop(stage, None)
-        attempts = _stage_attempts()
+        # Publishing re-uploads the whole video on every attempt, so a failure
+        # is reported at once instead of silently repeating a multi-minute
+        # upload - the task resumes on request once the cause is fixed.
+        attempts = 1 if stage == "publish" else _stage_attempts()
         delay = _stage_retry_delay()
         for attempt in range(1, attempts + 1):
             try:
@@ -479,7 +508,7 @@ class PipelineRunner:
             self.artifacts.dubbing_file = _require_existing(session / "tmp" / "audio_dubbing.wav", "dubbing_file")
             self.artifacts.timings_file = _require_existing(session / "metadata" / "timings.json", "timings_file")
             return
-        if stage == "merge_video":
+        if stage in {"merge_video", "publish"}:
             self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
             return
         raise RuntimeError(f"Unknown pipeline stage: {stage}")
@@ -763,6 +792,55 @@ class PipelineRunner:
             )
         size_mb = self.artifacts.final_video.stat().st_size / (1024 * 1024)
         self.stage_message("merge_video", f"Final video: {self.artifacts.final_video} ({size_mb:.1f} MB)")
+
+    def _publish(self, task: dict) -> None:
+        """Upload the finished video to Bilibili.
+
+        Everything it needs was produced earlier: the copy, the suggested
+        partition and the suggested collection all come from the translate
+        stage, so this step makes no model calls of its own. The creation
+        declaration is fixed in the upload settings.
+        """
+        from .adapters import bilibili
+        from .adapters.openai_translate import load_bilibili_meta
+
+        session = _require(self.artifacts.session, "session")
+        video_file = _require(self.artifacts.final_video, "final_video")
+        meta = load_bilibili_meta(session) or {}
+        title = (meta.get("title") or task.get("title") or video_file.stem).strip()
+        self.stage_message("publish", f"Uploading to Bilibili: {title}")
+        outcome = bilibili.publish_video(
+            video_file=video_file,
+            session=session,
+            title=title,
+            description=(meta.get("description") or "").strip(),
+            tags=list(meta.get("tags") or []),
+            zone=(meta.get("zone") or "").strip(),
+            collection=(meta.get("collection") or "").strip(),
+            settings=database.get_bilibili_settings(),
+        )
+        bilibili.publish_artifact_path(session).write_text(
+            json.dumps(
+                {
+                    "bvid": outcome.bvid,
+                    "url": outcome.url,
+                    "title": title,
+                    "zone": outcome.zone,
+                    "collection": outcome.collection,
+                    "published_at": database.now_iso(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        if outcome.url:
+            self.stage_message("publish", f"Published: {outcome.url}")
+        else:
+            self.stage_message(
+                "publish",
+                "Published, but the page did not expose the video id; check the upload manager",
+            )
 
 
 def run_task(task_id: str) -> None:

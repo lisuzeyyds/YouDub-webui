@@ -12,6 +12,7 @@ from .config import (
     LEGACY_OPENAI_DEFAULT_BASE_URL,
     LEGACY_OPENAI_DEFAULT_MODEL,
     atlascloud_defaults,
+    bilibili_defaults,
     ensure_runtime_dirs,
     openai_defaults,
     ytdlp_defaults,
@@ -96,7 +97,8 @@ def init_db() -> None:
               started_at TEXT,
               completed_at TEXT,
               execution_mode TEXT NOT NULL DEFAULT 'auto',
-              output_mode TEXT NOT NULL DEFAULT 'both'
+              output_mode TEXT NOT NULL DEFAULT 'both',
+              auto_publish INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS task_stages (
@@ -148,6 +150,11 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (f"ytdlp.{key}", value, now_iso()),
             )
+        for key, value in bilibili_defaults().items():
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (f"bilibili.{key}", value, now_iso()),
+            )
         task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
         if "title" not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
@@ -158,6 +165,10 @@ def init_db() -> None:
         if "output_mode" not in task_columns:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN output_mode TEXT NOT NULL DEFAULT 'both'"
+            )
+        if "auto_publish" not in task_columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN auto_publish INTEGER NOT NULL DEFAULT 0"
             )
         stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
         if "progress" not in stage_columns:
@@ -336,6 +347,7 @@ def create_task(
     *,
     execution_mode: str = DEFAULT_EXECUTION_MODE,
     output_mode: str = DEFAULT_OUTPUT_MODE,
+    auto_publish: bool = False,
 ) -> str:
     new_id = task_id or str(uuid.uuid4())
     created_at = now_iso()
@@ -345,11 +357,20 @@ def create_task(
         conn.execute(
             """
             INSERT INTO tasks (
-              id, url, status, current_stage, created_at, execution_mode, output_mode
+              id, url, status, current_stage, created_at, execution_mode,
+              output_mode, auto_publish
             )
-            VALUES (?, ?, 'queued', ?, ?, ?, ?)
+            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
             """,
-            (new_id, url, STAGES[0].name, created_at, mode, normalized_output_mode),
+            (
+                new_id,
+                url,
+                STAGES[0].name,
+                created_at,
+                mode,
+                normalized_output_mode,
+                1 if auto_publish else 0,
+            ),
         )
         conn.executemany(
             """
@@ -367,6 +388,7 @@ def create_or_get_video_task(
     *,
     execution_mode: str = DEFAULT_EXECUTION_MODE,
     output_mode: str = DEFAULT_OUTPUT_MODE,
+    auto_publish: bool = False,
 ) -> tuple[str, bool]:
     from .youtube import extract_video_id
 
@@ -378,12 +400,21 @@ def create_or_get_video_task(
         cursor = conn.execute(
             """
             INSERT INTO tasks (
-              id, url, status, current_stage, created_at, execution_mode, output_mode
+              id, url, status, current_stage, created_at, execution_mode,
+              output_mode, auto_publish
             )
-            VALUES (?, ?, 'queued', ?, ?, ?, ?)
+            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO NOTHING
             """,
-            (task_id, url, STAGES[0].name, created_at, mode, normalized_output_mode),
+            (
+                task_id,
+                url,
+                STAGES[0].name,
+                created_at,
+                mode,
+                normalized_output_mode,
+                1 if auto_publish else 0,
+            ),
         )
         if cursor.rowcount == 1:
             conn.executemany(
@@ -570,6 +601,7 @@ def get_task(task_id: str) -> dict[str, Any] | None:
                 WHEN 'tts' THEN 7
                 WHEN 'merge_audio' THEN 8
                 WHEN 'merge_video' THEN 9
+                WHEN 'publish' THEN 10
                 ELSE 99
               END
             """,
@@ -718,6 +750,74 @@ def get_openai_settings() -> dict[str, str]:
             keys["translate_concurrency"], defaults["translate_concurrency"]
         ),
     }
+
+
+BILIBILI_SETTING_KEYS = {
+    "zones": "bilibili.zones",
+    "collections": "bilibili.collections",
+    "declare": "bilibili.declare",
+    "chrome_path": "bilibili.chrome_path",
+    "profile_dir": "bilibili.profile_dir",
+    "node_path": "bilibili.node_path",
+    "script_path": "bilibili.script_path",
+}
+
+
+def get_bilibili_settings() -> dict[str, str]:
+    """Upload-related settings (partition/collection candidates, declaration)."""
+    defaults = bilibili_defaults()
+    keys = BILIBILI_SETTING_KEYS
+    placeholders = ", ".join("?" for _ in keys)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+            tuple(keys.values()),
+        ).fetchall()
+    saved = {row["key"]: row["value"] for row in rows}
+    return {
+        name: saved.get(setting_key, defaults[name])
+        for name, setting_key in keys.items()
+    }
+
+
+def bilibili_option_list(value: str) -> list[str]:
+    """Split a comma-separated setting into an ordered, de-duplicated list."""
+    normalized = value or ""
+    for separator in ("，", "、", "；", ";", "\n", "\r"):
+        normalized = normalized.replace(separator, ",")
+    options: list[str] = []
+    seen: set[str] = set()
+    for part in normalized.split(","):
+        item = part.strip()
+        if item and item not in seen:
+            seen.add(item)
+            options.append(item)
+    return options
+
+
+def save_bilibili_settings(values: dict[str, str]) -> None:
+    """Persist the upload settings the operator can edit.
+
+    Zones and collections are free text (comma separated) because Bilibili has
+    no stable public list to validate against; the publish stage matches the
+    suggestion against whatever the dropdown actually offers at upload time.
+    """
+    updated_at = now_iso()
+    updates = {
+        BILIBILI_SETTING_KEYS[name]: (value or "").strip()
+        for name, value in values.items()
+        if name in BILIBILI_SETTING_KEYS
+    }
+    if not updates:
+        return
+    with connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            [(key, value, updated_at) for key, value in updates.items()],
+        )
 
 
 def save_openai_settings(

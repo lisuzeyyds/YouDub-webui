@@ -1607,6 +1607,44 @@ def test_ytdlp_proxy_port_settings(monkeypatch, tmp_path):
     assert loaded.json() == {"proxy_port": "7890"}
 
 
+def test_bilibili_settings_round_trip(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = authenticated_client()
+
+    defaults = client.get("/api/settings/bilibili")
+    assert defaults.status_code == 200
+    # The declaration the publish stage must always select is filled in already.
+    assert defaults.json()["declare"] == config.DEFAULT_BILIBILI_DECLARE
+    assert defaults.json()["collections"] == ""
+
+    saved = client.post(
+        "/api/settings/bilibili",
+        json={"zones": "游戏,知识,游戏", "collections": "mc、科普", "declare": "内容无需标注"},
+    )
+    assert saved.status_code == 200
+
+    loaded = client.get("/api/settings/bilibili")
+    assert loaded.status_code == 200
+    body = loaded.json()
+    assert body["zones"] == "游戏,知识,游戏"
+    # Duplicates are collapsed and Chinese separators normalised for the prompt.
+    assert body["zone_list"] == ["游戏", "知识"]
+    assert body["collection_list"] == ["mc", "科普"]
+
+
+def test_bilibili_settings_partial_save_keeps_the_other_values(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = authenticated_client()
+
+    client.post("/api/settings/bilibili", json={"zones": "游戏", "collections": "mc"})
+    client.post("/api/settings/bilibili", json={"declare": "含AI生成内容"})
+
+    body = client.get("/api/settings/bilibili").json()
+    assert body["zones"] == "游戏"
+    assert body["collections"] == "mc"
+    assert body["declare"] == "含AI生成内容"
+
+
 def test_ytdlp_proxy_port_rejects_invalid_value(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     client = authenticated_client()

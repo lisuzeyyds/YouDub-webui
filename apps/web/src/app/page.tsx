@@ -98,6 +98,7 @@ export default function Home() {
   const [localDirection, setLocalDirection] = useState<LocalDirection>("en-zh")
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("auto")
   const [outputMode, setOutputMode] = useState<OutputMode>("both")
+  const [autoPublish, setAutoPublish] = useState(false)
   const [tasks, setTasks] = useState<TaskSummary[]>([])
   const [taskTotal, setTaskTotal] = useState(0)
   const [activeTaskCount, setActiveTaskCount] = useState<number | null>(null)
@@ -247,8 +248,9 @@ export default function Home() {
           localSubtitleFile,
           executionMode,
           outputMode,
+          autoPublish,
         )
-        : await createTask(submittedUrl, executionMode, outputMode)
+        : await createTask(submittedUrl, executionMode, outputMode, autoPublish)
       setYoutubeUrl("")
       setBilibiliUrl("")
       setLocalFile(null)
@@ -414,6 +416,24 @@ export default function Home() {
                   </Select>
                 </div>
               </div>
+              <label
+                htmlFor="auto-publish"
+                className="flex cursor-pointer items-start gap-2.5 rounded-md border border-border/60 px-3 py-2.5"
+              >
+                <input
+                  id="auto-publish"
+                  type="checkbox"
+                  className="mt-0.5 size-4 shrink-0 accent-primary"
+                  checked={autoPublish}
+                  onChange={(event) => setAutoPublish(event.target.checked)}
+                />
+                <span className="space-y-0.5">
+                  <span className="block text-sm font-medium">{t.home.autoPublishLabel}</span>
+                  <span className="block text-xs text-muted-foreground">
+                    {t.home.autoPublishHelp}
+                  </span>
+                </span>
+              </label>
               <div className="flex items-center justify-between gap-3">
                 {activeTaskCount !== null && activeTaskCount > 0 ? (
                   <p className="text-xs text-muted-foreground">

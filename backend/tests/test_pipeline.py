@@ -61,8 +61,9 @@ def test_pipeline_marks_all_stages_succeeded(monkeypatch, tmp_path):
 
     assert task["status"] == "succeeded"
     assert task["final_video_path"] == str(final_path)
-    assert [stage["status"] for stage in task["stages"]] == ["succeeded"] * 9
-    assert [stage["progress"] for stage in task["stages"]] == [100] * 9
+    # The publish stage is opt-in, so a plain task reports it as skipped.
+    assert [stage["status"] for stage in task["stages"]] == ["succeeded"] * 9 + ["skipped"]
+    assert [stage["progress"] for stage in task["stages"]] == [100] * len(STAGES)
 
 
 def test_subtitles_pipeline_skips_dubbing_stages(monkeypatch, tmp_path):
@@ -803,7 +804,11 @@ def test_pipeline_manual_completes_immediately_after_final_stage(monkeypatch, tm
     for stage in STAGES:
         monkeypatch.setattr(PipelineRunner, f"_{stage.name}", make_stage_handler(stage.name))
 
-    for index, stage in enumerate(STAGES):
+    # This task did not opt into publishing, so the last stage that actually
+    # runs is merge_video; the publish row is reported as skipped.
+    real_stages = [stage for stage in STAGES if stage.name != "publish"]
+
+    for index, stage in enumerate(real_stages):
         if index > 0:
             database.queue_task_for_continue(task_id)
 
@@ -812,19 +817,22 @@ def test_pipeline_manual_completes_immediately_after_final_stage(monkeypatch, tm
         stage_statuses = [entry["status"] for entry in task["stages"]]
 
         assert stage_statuses[: index + 1] == ["succeeded"] * (index + 1)
-        assert stage_statuses[index + 1 :] == ["pending"] * (len(STAGES) - index - 1)
-        if index < len(STAGES) - 1:
-            assert task["status"] == "paused"
-            assert task["current_stage"] == stage.name
-            assert task["final_video_path"] is None
-            assert task["completed_at"] is None
-        else:
+        if index == len(real_stages) - 1:
+            assert stage_statuses[index + 1 :] == ["skipped"]
+            # A skipped stage is not work the user has to approve, so manual
+            # mode finishes here instead of pausing on it.
             assert task["status"] == "succeeded"
             assert task["current_stage"] == "done"
             assert task["final_video_path"] == str(final_path)
             assert task["completed_at"] is not None
+        else:
+            assert stage_statuses[index + 1 :] == ["pending"] * (len(STAGES) - index - 1)
+            assert task["status"] == "paused"
+            assert task["current_stage"] == stage.name
+            assert task["final_video_path"] is None
+            assert task["completed_at"] is None
 
-    assert visited == [stage.name for stage in STAGES]
+    assert visited == [stage.name for stage in real_stages]
     assert [stage["progress"] for stage in task["stages"]] == [100] * len(STAGES)
     log_content = database.log_path(task_id).read_text(encoding="utf-8")
     assert "Task succeeded" in log_content
@@ -871,7 +879,12 @@ def test_pipeline_manual_switch_to_auto_runs_remaining_stages(monkeypatch, tmp_p
     task = database.get_task(task_id)
     assert task["status"] == "succeeded"
     assert task["execution_mode"] == "auto"
-    assert all(stage["status"] == "succeeded" for stage in task["stages"])
+    # Publishing is opt-in and this task never opted in, so the stage is skipped
+    # rather than uploaded; every other stage had to run to completion.
+    assert all(
+        stage["status"] == "succeeded" for stage in task["stages"] if stage["name"] != "publish"
+    )
+    assert next(stage for stage in task["stages"] if stage["name"] == "publish")["status"] == "skipped"
 
 
 def test_pipeline_uses_uploaded_srt_and_skips_model_stages(monkeypatch, tmp_path):

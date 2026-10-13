@@ -8,5 +8,8 @@
     "test:backend": "pytest backend/tests",
     "lint:web": "npm --prefix apps/web run lint",
     "build:web": "npm --prefix apps/web run build"
+  },
+  "dependencies": {
+    "playwright-core": "^1.64.0"
   }
 }

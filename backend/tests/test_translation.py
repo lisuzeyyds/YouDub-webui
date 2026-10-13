@@ -1039,10 +1039,10 @@ def test_translate_batch_falls_back_to_a_copy_request(monkeypatch):
     """
     seen: dict[str, object] = {}
 
-    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url="", **kwargs):
         return {i: f"zh{i}" for i in range(1, len(texts) + 1)}
 
-    def fake_copy(texts, system, *, client, model):
+    def fake_copy(texts, system, *, client, model, **kwargs):
         seen["texts"] = list(texts)
         seen["has_link"] = "https://youtu.be/xyz" in system
         return openai_translate.BulkResult(
@@ -1071,7 +1071,7 @@ def test_translate_batch_falls_back_to_a_copy_request(monkeypatch):
 def test_translate_batch_skips_the_copy_fallback_when_sections_arrived(monkeypatch):
     """No extra request when the whole-transcript reply already carried the copy."""
 
-    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url="", **kwargs):
         return openai_translate.BulkResult(
             lines={i: f"zh{i}" for i in range(1, len(texts) + 1)},
             title="原标题",
@@ -1097,7 +1097,7 @@ def test_translate_batch_prefers_one_bulk_request(monkeypatch):
     bulk_calls: list[list[str]] = []
     single_calls: list[str] = []
 
-    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url="", **kwargs):
         bulk_calls.append(list(texts))
         return {i: f"zh{i}" for i in range(1, len(texts) + 1)}
 
@@ -1122,7 +1122,7 @@ def test_translate_batch_prefers_one_bulk_request(monkeypatch):
 
 def test_translate_batch_tops_up_only_missing_bulk_lines(monkeypatch):
     """A truncated bulk reply only costs the lines it actually missed."""
-    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url="", **kwargs):
         return {1: "zh1", 3: "zh3"}
 
     single_calls: list[str] = []
@@ -1159,7 +1159,7 @@ def test_translate_batch_falls_back_entirely_when_bulk_is_unavailable(monkeypatc
 
 
 def test_translate_batch_caches_bulk_results(monkeypatch, tmp_path):
-    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url="", **kwargs):
         return {i: f"zh{i}" for i in range(1, len(texts) + 1)}
 
     monkeypatch.setattr(openai_translate, "translate_bulk", fake_bulk)
@@ -1260,14 +1260,49 @@ def test_bulk_metadata_survives_a_truncated_translation_block():
     assert result.lines == {1: "你好。", 2: ""}
 
 
+def test_parse_choice_only_returns_a_known_option():
+    options = ["游戏", "知识", "生活"]
+    assert openai_translate._parse_choice("知识", options) == "知识"
+    assert openai_translate._parse_choice(" 知 识 ", options) == "知识"
+    assert openai_translate._parse_choice("- **生活**", options) == "生活"
+    assert openai_translate._parse_choice("分区：游戏（实况）", options) == "游戏"
+    # A value the upload page would not recognise must never leak through.
+    assert openai_translate._parse_choice("鬼畜", options) == ""
+    assert openai_translate._parse_choice("", options) == ""
+    assert openai_translate._parse_choice("随便写点什么", options) == ""
+    # "无" is a valid answer for the collection, and only there.
+    assert openai_translate._parse_choice("无", options, none_values=("无",)) == ""
+    assert openai_translate._parse_choice("无", options) == ""
+
+
+def test_parse_bulk_reads_the_zone_and_collection_hints():
+    raw = (
+        "#=== 标题 ===\n好标题\n"
+        "#=== 建议分区 ===\n游戏\n"
+        "#=== 建议合集 ===\n无\n"
+        "#=== 逐行译文 ===\n1\t你好。\n"
+    )
+    result = openai_translate._parse_bulk(
+        raw,
+        1,
+        zone_options=["游戏", "知识"],
+        collection_options=["mc", "纪录片"],
+    )
+    assert result.zone == "游戏"
+    assert result.collection == ""
+    assert result.lines == {1: "你好。"}
+
+
 def test_translate_batch_flags_ad_lines_and_reports_the_bilibili_copy(monkeypatch):
-    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url="", **kwargs):
         return openai_translate.BulkResult(
             lines={1: "你好。", 3: "世界。"},
             ad_lines={2},
             title="好标题",
             description="原视频：https://youtu.be/x",
             tags=["标签a", "标签b"],
+            zone="知识",
+            collection="纪录片",
         )
 
     monkeypatch.setattr(openai_translate, "translate_bulk", fake_bulk)
@@ -1285,10 +1320,14 @@ def test_translate_batch_flags_ad_lines_and_reports_the_bilibili_copy(monkeypatc
     assert [item.dst for item in out] == ["你好。", "", "世界。"]
     assert [item.is_ad for item in out] == [False, True, False]
     assert out[1].audio_mode == "original"
+    # The zone/collection guesses travel with the rest of the upload copy so the
+    # publish stage can pre-select them without asking the user.
     assert meta_out == {
         "title": "好标题",
         "description": "原视频：https://youtu.be/x",
         "tags": ["标签a", "标签b"],
+        "zone": "知识",
+        "collection": "纪录片",
     }
 
 
@@ -1304,6 +1343,8 @@ def test_translate_asr_records_ad_rows_and_writes_the_bilibili_copy(tmp_path, mo
             title="好标题",
             description="这期带你拆解全片。",
             tags=["影视解说"],
+            zone="知识",
+            collection="纪录片",
         )
         return [
             openai_translate.TranslationItem(dst="你好。", audio_mode="tts"),
@@ -1325,6 +1366,9 @@ def test_translate_asr_records_ad_rows_and_writes_the_bilibili_copy(tmp_path, mo
     assert written["title"] == "好标题"
     assert written["source_url"] == "https://youtu.be/x"
     assert written["tags"] == ["影视解说"]
+    # Zone and collection are persisted for the publish stage to pre-select.
+    assert written["zone"] == "知识"
+    assert written["collection"] == "纪录片"
     # The source link is appended when the model forgot it.
     assert "https://youtu.be/x" in written["description"]
 

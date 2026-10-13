@@ -43,6 +43,19 @@ describe("设置分项保存反馈", () => {
       if (method === "GET" && path === "/api/settings/ytdlp") {
         return jsonResponse({ proxy_port: "" })
       }
+      if (method === "GET" && path === "/api/settings/bilibili") {
+        return jsonResponse({
+          zones: "游戏,知识",
+          collections: "mc",
+          declare: "内容无需标注",
+          chrome_path: "",
+          profile_dir: "",
+          node_path: "",
+          script_path: "",
+          zone_list: ["游戏", "知识"],
+          collection_list: ["mc"],
+        })
+      }
       throw new Error(`未预期的请求: ${method} ${path}`)
     })
     vi.stubGlobal("fetch", mocks.fetch)
@@ -84,6 +97,32 @@ describe("设置分项保存反馈", () => {
       }
       if (method === "GET" && path === "/api/settings/ytdlp") {
         return jsonResponse({ proxy_port: "7890" })
+      }
+      if (method === "GET" && path === "/api/settings/bilibili") {
+        return jsonResponse({
+          zones: "游戏,知识",
+          collections: "mc,科普",
+          declare: "内容无需标注",
+          chrome_path: "",
+          profile_dir: "",
+          node_path: "",
+          script_path: "",
+          zone_list: ["游戏", "知识"],
+          collection_list: ["mc", "科普"],
+        })
+      }
+      if (method === "POST" && path === "/api/settings/bilibili") {
+        return jsonResponse({
+          zones: "游戏,知识",
+          collections: "mc,科普",
+          declare: "内容无需标注",
+          chrome_path: "",
+          profile_dir: "",
+          node_path: "",
+          script_path: "",
+          zone_list: ["游戏", "知识"],
+          collection_list: ["mc", "科普"],
+        })
       }
       if (method === "POST" && path === "/api/cookies/youtube") {
         return jsonResponse({ exists: true, size: 256, updated_at: 2, content: "" })
@@ -146,12 +185,14 @@ describe("设置分项保存反馈", () => {
       "/api/cookies/youtube",
       "/api/settings/openai",
       "/api/settings/ytdlp",
+      "/api/settings/bilibili",
     ])
 
     for (const path of [
       "/api/cookies/youtube",
       "/api/settings/openai",
       "/api/settings/ytdlp",
+      "/api/settings/bilibili",
     ]) {
       const getCount = mocks.fetch.mock.calls.filter(
         ([input, init]) => String(input) === path && (init?.method || "GET") === "GET",

@@ -180,3 +180,27 @@ def ytdlp_defaults() -> dict[str, str]:
     return {
         "proxy_port": os.getenv("YTDLP_PROXY_PORT", ""),
     }
+
+
+# Top-level Bilibili partitions the upload page offers. The model is told to pick
+# one of these verbatim, which keeps its answer matchable against the page's own
+# option list; an empty setting disables the suggestion.
+DEFAULT_BILIBILI_ZONES = (
+    "游戏,知识,科技,生活,美食,动物,鬼畜,音乐,影视,舞蹈,时尚,娱乐,运动,汽车,"
+    "纪录片,资讯,动画,番剧,国创,电影,电视剧"
+)
+
+# Bilibili's upload page demands a creation declaration; it cannot be skipped.
+DEFAULT_BILIBILI_DECLARE = "内容无需标注"
+
+
+def bilibili_defaults() -> dict[str, str]:
+    return {
+        "zones": os.getenv("BILIBILI_ZONES", DEFAULT_BILIBILI_ZONES),
+        "collections": os.getenv("BILIBILI_COLLECTIONS", ""),
+        "declare": os.getenv("BILIBILI_DECLARE", DEFAULT_BILIBILI_DECLARE),
+        "chrome_path": os.getenv("BILIBILI_CHROME_PATH", "").strip(),
+        "profile_dir": os.getenv("BILIBILI_PROFILE_DIR", "").strip(),
+        "node_path": os.getenv("BILIBILI_NODE_PATH", "").strip(),
+        "script_path": os.getenv("BILIBILI_SCRIPT_PATH", "").strip(),
+    }

@@ -106,6 +106,17 @@ export type BilibiliMeta = {
   description: string
   tags: string[]
   source_url: string
+  zone?: string
+  collection?: string
+}
+
+export type PublishResult = {
+  bvid: string
+  url: string
+  title: string
+  zone: string
+  collection: string
+  published_at: string
 }
 
 export type AdCutPlan = {
@@ -131,9 +142,11 @@ export type Task = {
   completed_at: string | null
   execution_mode: ExecutionMode
   output_mode: OutputMode
+  auto_publish: number | boolean
   stages: TaskStage[]
   bilibili?: BilibiliMeta | null
   ad_cut?: AdCutPlan | null
+  publish?: PublishResult | null
 }
 
 export type CookieInfo = {
@@ -314,10 +327,16 @@ export function createTask(
   url: string,
   executionMode: ExecutionMode = "auto",
   outputMode: OutputMode = "both",
+  autoPublish = false,
 ) {
   return request<Task>("/api/tasks", {
     method: "POST",
-    body: JSON.stringify({ url, execution_mode: executionMode, output_mode: outputMode }),
+    body: JSON.stringify({
+      url,
+      execution_mode: executionMode,
+      output_mode: outputMode,
+      auto_publish: autoPublish,
+    }),
   })
 }
 
@@ -327,6 +346,7 @@ export async function uploadLocalTask(
   subtitleFile: File | null = null,
   executionMode: ExecutionMode = "auto",
   outputMode: OutputMode = "both",
+  autoPublish = false,
 ) {
   const form = new FormData()
   form.append("direction", direction)
@@ -336,6 +356,7 @@ export async function uploadLocalTask(
   }
   form.append("execution_mode", executionMode)
   form.append("output_mode", outputMode)
+  form.append("auto_publish", autoPublish ? "true" : "false")
 
   const options: RequestInit = {
     method: "POST",
@@ -394,6 +415,29 @@ export function getYtdlpSettings() {
 
 export function saveYtdlpSettings(settings: YtdlpSettings) {
   return request<YtdlpSettings>("/api/settings/ytdlp", {
+    method: "POST",
+    body: JSON.stringify(settings),
+  })
+}
+
+export type BilibiliSettings = {
+  zones: string
+  collections: string
+  declare: string
+  chrome_path: string
+  profile_dir: string
+  node_path: string
+  script_path: string
+  zone_list?: string[]
+  collection_list?: string[]
+}
+
+export function getBilibiliSettings() {
+  return request<BilibiliSettings>("/api/settings/bilibili")
+}
+
+export function saveBilibiliSettings(settings: Partial<BilibiliSettings>) {
+  return request<BilibiliSettings>("/api/settings/bilibili", {
     method: "POST",
     body: JSON.stringify(settings),
   })

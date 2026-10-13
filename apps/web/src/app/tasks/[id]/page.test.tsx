@@ -35,6 +35,7 @@ function taskWithStatus(status: TaskStatus): Task {
     completed_at: null,
     execution_mode: "manual",
     output_mode: "dubbing",
+    auto_publish: 0,
     stages: [{
       task_id: "task-race",
       name: "download",

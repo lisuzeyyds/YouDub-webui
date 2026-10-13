@@ -14,6 +14,7 @@ import {
   RotateCw,
   Scissors,
   Trash2,
+  Upload,
   XCircle,
 } from "lucide-react"
 
@@ -241,6 +242,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const adCutBreaks = adCut?.spans.length ?? 0
   const adCutRemoved = adCut?.removed.length ?? 0
   const adCutSeconds = adCut?.cut_ms ? (adCut.cut_ms / 1000).toFixed(1) : "0"
+  const published = task?.publish ?? null
 
   if (error && !task) {
     return (
@@ -428,6 +430,47 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                     ))}
                   </ul>
                 </details>
+              ) : null}
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {published ? (
+          <Card>
+            <CardHeader className="gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Upload className="size-4 text-muted-foreground" />
+                <CardTitle>{t.task.publishResult}</CardTitle>
+                {published.bvid ? (
+                  <Badge className="border-emerald-200 bg-emerald-50 text-emerald-700">
+                    {published.bvid}
+                  </Badge>
+                ) : null}
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              {published.title ? <p className="font-medium">{published.title}</p> : null}
+              <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
+                {published.zone ? (
+                  <span>
+                    {t.task.publishZone}: {published.zone}
+                  </span>
+                ) : null}
+                {published.collection ? (
+                  <span>
+                    {t.task.publishCollection}: {published.collection}
+                  </span>
+                ) : null}
+              </div>
+              {published.url ? (
+                <a
+                  className="inline-flex items-center gap-1 text-blue-600 hover:underline"
+                  href={published.url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {t.task.publishLink}
+                </a>
               ) : null}
             </CardContent>
           </Card>

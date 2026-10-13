@@ -5,10 +5,12 @@ import { Cloud, Eye, EyeOff, RefreshCw, Settings } from "lucide-react"
 
 import {
   ApiError,
+  getBilibiliSettings,
   getCookieInfo,
   getOpenAIModels,
   getOpenAISettings,
   getYtdlpSettings,
+  saveBilibiliSettings,
   saveCookie,
   saveOpenAISettings,
   saveYtdlpSettings,
@@ -42,13 +44,16 @@ type SettingsForm = {
   model: string
   translateConcurrency: string
   proxyPort: string
+  bilibiliZones: string
+  bilibiliCollections: string
+  bilibiliDeclare: string
 }
 
 const SAVED_API_KEY_MASK = "********"
 const SAVED_COOKIE_SENTINEL = "__YOUDUB_SAVED_COOKIE__"
 
 type MessageKey = "keySaved"
-type SaveSection = "cookie" | "openai" | "ytdlp"
+type SaveSection = "cookie" | "openai" | "ytdlp" | "bilibili"
 type SaveResult = {
   section: SaveSection
   status: "saved" | "failed" | "unchanged"
@@ -62,6 +67,9 @@ const defaultSettings: SettingsForm = {
   model: "gpt-4o-mini",
   translateConcurrency: "50",
   proxyPort: "",
+  bilibiliZones: "",
+  bilibiliCollections: "",
+  bilibiliDeclare: "",
 }
 
 const ATLAS_CLOUD_PRESET = {
@@ -94,8 +102,8 @@ export function SettingsDialog() {
 
   useEffect(() => {
     if (!open) return
-    Promise.all([getCookieInfo(), getOpenAISettings(), getYtdlpSettings()])
-      .then(([cookie, openai, ytdlp]) => {
+    Promise.all([getCookieInfo(), getOpenAISettings(), getYtdlpSettings(), getBilibiliSettings()])
+      .then(([cookie, openai, ytdlp, bilibili]) => {
         setSettings({
           cookie: cookie.exists ? SAVED_COOKIE_SENTINEL : "",
           baseUrl: openai.base_url,
@@ -103,6 +111,9 @@ export function SettingsDialog() {
           model: openai.model,
           translateConcurrency: openai.translate_concurrency || "50",
           proxyPort: ytdlp.proxy_port,
+          bilibiliZones: bilibili.zones,
+          bilibiliCollections: bilibili.collections,
+          bilibiliDeclare: bilibili.declare,
         })
         setModelOptions(uniqueModels([openai.model]))
         setModelsLoaded(false)
@@ -120,10 +131,11 @@ export function SettingsDialog() {
   }, [open])
 
   async function refreshSettingsFromServer() {
-    const [cookieResult, openaiResult, ytdlpResult] = await Promise.allSettled([
+    const [cookieResult, openaiResult, ytdlpResult, bilibiliResult] = await Promise.allSettled([
       getCookieInfo(),
       getOpenAISettings(),
       getYtdlpSettings(),
+      getBilibiliSettings(),
     ])
 
     setSettings((current) => {
@@ -141,6 +153,11 @@ export function SettingsDialog() {
       if (ytdlpResult.status === "fulfilled") {
         refreshed.proxyPort = ytdlpResult.value.proxy_port
       }
+      if (bilibiliResult.status === "fulfilled") {
+        refreshed.bilibiliZones = bilibiliResult.value.zones
+        refreshed.bilibiliCollections = bilibiliResult.value.collections
+        refreshed.bilibiliDeclare = bilibiliResult.value.declare
+      }
       return refreshed
     })
 
@@ -152,7 +169,7 @@ export function SettingsDialog() {
       setModelsLoaded(false)
     }
 
-    return [cookieResult, openaiResult, ytdlpResult].every(
+    return [cookieResult, openaiResult, ytdlpResult, bilibiliResult].every(
       (result) => result.status === "fulfilled",
     )
   }
@@ -193,6 +210,11 @@ export function SettingsDialog() {
         translate_concurrency: settings.translateConcurrency,
       }))
       await saveSection("ytdlp", () => saveYtdlpSettings({ proxy_port: settings.proxyPort }))
+      await saveSection("bilibili", () => saveBilibiliSettings({
+        zones: settings.bilibiliZones,
+        collections: settings.bilibiliCollections,
+        declare: settings.bilibiliDeclare,
+      }))
       setSaveResults(results)
       setSettings((current) => ({
         ...current,
@@ -246,6 +268,7 @@ export function SettingsDialog() {
     cookie: t.settings.cookie,
     openai: t.settings.openaiSaveSection,
     ytdlp: t.settings.ytdlpSaveSection,
+    bilibili: t.settings.bilibiliSaveSection,
   }
 
   function saveResultText(result: SaveResult) {
@@ -439,6 +462,42 @@ export function SettingsDialog() {
                 <p className="text-xs text-muted-foreground">
                   {t.settings.concurrencyHelp}
                 </p>
+              </div>
+              <div className="grid gap-2 rounded-lg border border-border/60 p-3">
+                <p className="text-sm font-medium">{t.settings.bilibiliSection}</p>
+                <p className="text-xs text-muted-foreground">{t.settings.bilibiliHelp}</p>
+                <Label htmlFor="bilibiliDeclare">{t.settings.bilibiliDeclare}</Label>
+                <Input
+                  id="bilibiliDeclare"
+                  value={settings.bilibiliDeclare}
+                  onChange={(event) =>
+                    setSettings((current) => ({ ...current, bilibiliDeclare: event.target.value }))
+                  }
+                  placeholder="内容无需标注"
+                />
+                <Label htmlFor="bilibiliZones">{t.settings.bilibiliZones}</Label>
+                <Textarea
+                  id="bilibiliZones"
+                  value={settings.bilibiliZones}
+                  onChange={(event) =>
+                    setSettings((current) => ({ ...current, bilibiliZones: event.target.value }))
+                  }
+                  placeholder="游戏, 知识, 科技"
+                  className="min-h-16 text-xs"
+                />
+                <Label htmlFor="bilibiliCollections">{t.settings.bilibiliCollections}</Label>
+                <Textarea
+                  id="bilibiliCollections"
+                  value={settings.bilibiliCollections}
+                  onChange={(event) =>
+                    setSettings((current) => ({
+                      ...current,
+                      bilibiliCollections: event.target.value,
+                    }))
+                  }
+                  placeholder="mc, 科普"
+                  className="min-h-16 text-xs"
+                />
               </div>
               {saveResults.length > 0 ? (
                 <div
