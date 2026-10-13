@@ -101,6 +101,22 @@ export type TaskStage = {
   error_message: string | null
 }
 
+export type BilibiliMeta = {
+  title: string
+  description: string
+  tags: string[]
+  source_url: string
+}
+
+export type AdCutPlan = {
+  spans: [number, number][]
+  removed: { src: string; start_time: number | null; end_time: number | null }[]
+  duration_ms: number | null
+  cut_ms: number
+  output_duration_ms: number | null
+  skipped_reason: string
+}
+
 export type Task = {
   id: string
   url: string
@@ -116,6 +132,8 @@ export type Task = {
   execution_mode: ExecutionMode
   output_mode: OutputMode
   stages: TaskStage[]
+  bilibili?: BilibiliMeta | null
+  ad_cut?: AdCutPlan | null
 }
 
 export type CookieInfo = {

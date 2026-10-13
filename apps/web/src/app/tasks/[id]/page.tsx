@@ -6,11 +6,13 @@ import {
   CheckCircle2,
   Circle,
   CircleMinus,
+  Copy,
   Download,
   FileText,
   Loader2,
   Play,
   RotateCw,
+  Scissors,
   Trash2,
   XCircle,
 } from "lucide-react"
@@ -107,6 +109,17 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [redoingStage, setRedoingStage] = useState<string | null>(null)
   const [redoConfirmStage, setRedoConfirmStage] = useState<string | null>(null)
   const [redoError, setRedoError] = useState("")
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
+
+  const copyText = useCallback(async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopiedKey(key)
+      window.setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 1600)
+    } catch {
+      setCopiedKey(null)
+    }
+  }, [])
 
   const pollTask = useCallback(async ({ signal, isCurrent }: SerialPollingContext) => {
     try {
@@ -223,6 +236,12 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     return Math.round((completed / task.stages.length) * 100)
   }, [task])
 
+  const bilibili = task?.bilibili ?? null
+  const adCut = task?.ad_cut ?? null
+  const adCutBreaks = adCut?.spans.length ?? 0
+  const adCutRemoved = adCut?.removed.length ?? 0
+  const adCutSeconds = adCut?.cut_ms ? (adCut.cut_ms / 1000).toFixed(1) : "0"
+
   if (error && !task) {
     return (
       <main className="min-h-screen bg-[linear-gradient(135deg,#fff5f5_0%,#f2fbff_48%,#fff4fa_100%)] text-foreground">
@@ -296,6 +315,123 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
             )}
           </CardContent>
         </Card>
+
+        {bilibili ? (
+          <Card>
+            <CardHeader className="gap-1.5">
+              <CardTitle>{t.task.uploadCopy}</CardTitle>
+              <p className="text-sm text-muted-foreground">{t.task.uploadCopyHelp}</p>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t.task.uploadCopyTitle}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!bilibili.title}
+                    onClick={() => copyText("title", bilibili.title)}
+                  >
+                    <Copy className="size-3.5" />
+                    {copiedKey === "title" ? t.task.copied : t.task.copyTitle}
+                  </Button>
+                </div>
+                <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm font-medium break-words">
+                  {bilibili.title || "—"}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t.task.uploadCopyDescription}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!bilibili.description}
+                    onClick={() => copyText("description", bilibili.description)}
+                  >
+                    <Copy className="size-3.5" />
+                    {copiedKey === "description" ? t.task.copied : t.task.copyDescription}
+                  </Button>
+                </div>
+                <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm whitespace-pre-wrap break-words">
+                  {bilibili.description || "—"}
+                </p>
+              </div>
+
+              {bilibili.tags.length ? (
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t.task.uploadCopyTags}
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {bilibili.tags.map((tag) => (
+                      <Badge key={tag} className="border-border bg-muted text-foreground">
+                        {tag}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <Button
+                variant="outline"
+                onClick={() =>
+                  copyText("all", `${bilibili.title}\n\n${bilibili.description}`.trim())
+                }
+              >
+                <Copy className="size-4" />
+                {copiedKey === "all" ? t.task.copied : t.task.copyAll}
+              </Button>
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {adCut && (adCutBreaks || adCutRemoved) ? (
+          <Card>
+            <CardHeader className="gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Scissors className="size-4 text-muted-foreground" />
+                <CardTitle>{t.task.adCut}</CardTitle>
+                {adCut.cut_ms ? (
+                  <Badge className="border-emerald-200 bg-emerald-50 text-emerald-700">
+                    {t.task.adCutRemovedShort.replace("{seconds}", adCutSeconds)}
+                  </Badge>
+                ) : null}
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <p className="text-muted-foreground">
+                {t.task.adCutSummary
+                  .replace("{breaks}", String(adCutBreaks))
+                  .replace("{removed}", String(adCutRemoved))}
+              </p>
+              {adCut.skipped_reason ? (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
+                  {t.task.adCutSkipped} {adCut.skipped_reason}
+                </p>
+              ) : null}
+              {adCut.removed.length ? (
+                <details className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+                  <summary className="cursor-pointer text-xs text-muted-foreground">
+                    {t.task.adCutLines} ({adCut.removed.length})
+                  </summary>
+                  <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+                    {adCut.removed.map((item, index) => (
+                      <li key={`${index}-${item.start_time}`} className="break-words">
+                        · {item.src}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+            </CardContent>
+          </Card>
+        ) : null}
 
         {task?.status === "succeeded" && task.final_video_path ? (
           <Card>
