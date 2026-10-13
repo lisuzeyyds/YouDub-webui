@@ -276,7 +276,7 @@ def test_translate_batch_replaces_em_dash_for_zh_target(monkeypatch):
         base_url="u", api_key="k", model="m",
     )
     assert [item.model_dump() for item in out] == [
-        {"dst": "你好，世界", "audio_mode": "tts"}
+        {"dst": "你好，世界", "audio_mode": "tts", "is_ad": False}
     ]
 
 
@@ -296,7 +296,7 @@ def test_translate_batch_does_not_replace_em_dash_for_en_target(monkeypatch):
         base_url="u", api_key="k", model="m",
     )
     assert [item.model_dump() for item in out] == [
-        {"dst": "He said—wait—and left.", "audio_mode": "tts"}
+        {"dst": "He said—wait—and left.", "audio_mode": "tts", "is_ad": False}
     ]
 
 
@@ -353,7 +353,7 @@ def test_translate_sentence_keeps_mixed_speech_in_tts_mode(monkeypatch):
         "[laughs] Help!", "zh", object(), "m", "sys"
     )
 
-    assert out.model_dump() == {"dst": "救命！", "audio_mode": "tts"}
+    assert out.model_dump() == {"dst": "救命！", "audio_mode": "tts", "is_ad": False}
 
 
 @pytest.mark.parametrize(
@@ -449,7 +449,7 @@ def test_translate_sentence_retries_transient_failures(monkeypatch):
 
     out = openai_translate.translate_sentence("Hello.", "zh", object(), "m", "sys")
 
-    assert out.model_dump() == {"dst": "你好。", "audio_mode": "tts"}
+    assert out.model_dump() == {"dst": "你好。", "audio_mode": "tts", "is_ad": False}
     assert calls["n"] == 3
 
 
@@ -678,7 +678,7 @@ def test_japanese_to_chinese_prompt_and_audio_mode_response_contract(monkeypatch
     )
 
     assert [item.model_dump() for item in translated] == [
-        {"dst": "今天天气很好。", "audio_mode": "tts"}
+        {"dst": "今天天气很好。", "audio_mode": "tts", "is_ad": False}
     ]
     assert "请将日文逐句翻译" in captured_systems[0]
     assert '"audio_mode": "tts 或 original"' in captured_systems[0]
@@ -740,10 +740,17 @@ def test_bulk_line_without_text_keeps_the_source_audio():
     assert openai_translate._fix_translation_item("   ").model_dump() == {
         "dst": "",
         "audio_mode": "original",
+        "is_ad": False,
     }
     assert openai_translate._fix_translation_item("你好。").model_dump() == {
         "dst": "你好。",
         "audio_mode": "tts",
+        "is_ad": False,
+    }
+    assert openai_translate._ad_translation_item().model_dump() == {
+        "dst": "",
+        "audio_mode": "original",
+        "is_ad": True,
     }
 
 
@@ -774,7 +781,10 @@ def test_translate_bulk_parses_a_single_request(monkeypatch):
         ["Hello.", "World."], YT_SOURCE, {}, PreprocessResponse(),
         client=object(), model="m",
     )
-    assert out == {1: "你好。", 2: "世界。"}
+    assert out is not None
+    assert out.lines == {1: "你好。", 2: "世界。"}
+    assert out.ad_lines == set()
+    assert out.title == ""
 
 
 def test_translate_bulk_retries_transport_failures(monkeypatch):
@@ -792,7 +802,8 @@ def test_translate_bulk_retries_transport_failures(monkeypatch):
     out = openai_translate.translate_bulk(
         ["Hello."], YT_SOURCE, {}, PreprocessResponse(), client=object(), model="m",
     )
-    assert out == {1: "你好。"}
+    assert out is not None
+    assert out.lines == {1: "你好。"}
     assert calls["n"] == 2
 
 
@@ -814,7 +825,7 @@ def test_translate_batch_prefers_one_bulk_request(monkeypatch):
     bulk_calls: list[list[str]] = []
     single_calls: list[str] = []
 
-    def fake_bulk(texts, source, meta, pre, *, client, model):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
         bulk_calls.append(list(texts))
         return {i: f"zh{i}" for i in range(1, len(texts) + 1)}
 
@@ -839,7 +850,7 @@ def test_translate_batch_prefers_one_bulk_request(monkeypatch):
 
 def test_translate_batch_tops_up_only_missing_bulk_lines(monkeypatch):
     """A truncated bulk reply only costs the lines it actually missed."""
-    def fake_bulk(texts, source, meta, pre, *, client, model):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
         return {1: "zh1", 3: "zh3"}
 
     single_calls: list[str] = []
@@ -876,7 +887,7 @@ def test_translate_batch_falls_back_entirely_when_bulk_is_unavailable(monkeypatc
 
 
 def test_translate_batch_caches_bulk_results(monkeypatch, tmp_path):
-    def fake_bulk(texts, source, meta, pre, *, client, model):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
         return {i: f"zh{i}" for i in range(1, len(texts) + 1)}
 
     monkeypatch.setattr(openai_translate, "translate_bulk", fake_bulk)
@@ -900,3 +911,160 @@ def test_translate_batch_caches_bulk_results(monkeypatch, tmp_path):
         base_url="u", api_key="k", model="m", concurrency=2, session=tmp_path,
     )
     assert [item.dst for item in second] == ["zh1", "zh2"]
+
+
+# --------------------------------------------------------------------------
+# One request: translations + ad lines + the Bilibili upload copy
+# --------------------------------------------------------------------------
+
+BULK_REPLY = """#=== 标题 ===
+【中字】Far Plane 2 全片解析
+#=== 简介 ===
+原视频：https://www.youtube.com/watch?v=abc123
+本期带你逐帧拆解。
+#=== 标签 ===
+影视解说, 科幻, 预告片解析
+#=== 广告行号 ===
+3-4, 9
+#=== 逐行译文 ===
+1\t你好。
+2\t世界。
+3\t[AD]
+4\t[AD]
+5\t继续。
+"""
+
+
+def test_split_bulk_sections_ignores_preamble_and_normalises_headers():
+    sections = openai_translate._split_bulk_sections("随便说两句\n" + BULK_REPLY)
+    assert sections["标题"] == "【中字】Far Plane 2 全片解析"
+    assert "youtube.com" in sections["简介"]
+    assert sections["广告行号"] == "3-4, 9"
+    assert sections["逐行译文"].startswith("1\t你好。")
+
+
+def test_parse_bulk_reads_every_section_in_one_pass():
+    result = openai_translate._parse_bulk(BULK_REPLY, expected=5)
+    assert result.title == "【中字】Far Plane 2 全片解析"
+    assert result.description.startswith("原视频：")
+    assert result.tags == ["影视解说", "科幻", "预告片解析"]
+    assert result.lines == {
+        1: "你好。", 2: "世界。", 3: "[AD]", 4: "[AD]", 5: "继续。",
+    }
+
+
+def test_parse_ad_lines_accepts_ranges_lists_and_none():
+    assert openai_translate._parse_ad_lines("3,7,12-14", 20) == {3, 7, 12, 13, 14}
+    assert openai_translate._parse_ad_lines("3、7", 20) == {3, 7}
+    assert openai_translate._parse_ad_lines("无", 20) == set()
+    assert openai_translate._parse_ad_lines("", 20) == set()
+    # Out-of-range values are clamped away instead of deleting a real sentence.
+    assert openai_translate._parse_ad_lines("1,99", 5) == {1}
+
+
+def test_merged_ad_lines_drops_indexes_past_the_end():
+    result = openai_translate._parse_bulk(BULK_REPLY, expected=5)
+    # The header lists 3-4 and 9; 9 is past the end of a 5-line transcript, so
+    # it is dropped before it can delete a sentence that does not exist.
+    assert result.ad_lines == {3, 4}
+    assert result.merged_ad_lines(5) == {3, 4}
+
+
+def test_merged_ad_lines_uses_the_inline_marker_when_the_header_is_missing():
+    result = openai_translate._parse_bulk("1\t你好。\n2\t[AD]\n3\t世界。", expected=3)
+    assert result.ad_lines == set()
+    assert result.merged_ad_lines(3) == {2}
+
+
+def test_bulk_metadata_survives_a_truncated_translation_block():
+    raw = (
+        "#=== 标题 ===\n好标题\n"
+        "#=== 广告行号 ===\n2\n"
+        "#=== 逐行译文 ===\n1\t你好。\n2\t"
+    )
+    result = openai_translate._parse_bulk(raw, expected=3)
+    assert result.title == "好标题"
+    assert result.merged_ad_lines(3) == {2}
+    assert result.lines == {1: "你好。", 2: ""}
+
+
+def test_translate_batch_flags_ad_lines_and_reports_the_bilibili_copy(monkeypatch):
+    def fake_bulk(texts, source, meta, pre, *, client, model, source_url=""):
+        return openai_translate.BulkResult(
+            lines={1: "你好。", 3: "世界。"},
+            ad_lines={2},
+            title="好标题",
+            description="原视频：https://youtu.be/x",
+            tags=["标签a", "标签b"],
+        )
+
+    monkeypatch.setattr(openai_translate, "translate_bulk", fake_bulk)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        openai_translate, "translate_sentence", lambda *a, **kw: pytest.fail("should not run")
+    )
+
+    meta_out: dict = {}
+    out = openai_translate.translate_batch(
+        ["a", "b", "c"], BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=3, meta_out=meta_out,
+    )
+
+    assert [item.dst for item in out] == ["你好。", "", "世界。"]
+    assert [item.is_ad for item in out] == [False, True, False]
+    assert out[1].audio_mode == "original"
+    assert meta_out == {
+        "title": "好标题",
+        "description": "原视频：https://youtu.be/x",
+        "tags": ["标签a", "标签b"],
+    }
+
+
+def test_translate_asr_records_ad_rows_and_writes_the_bilibili_copy(tmp_path, monkeypatch):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    asr_file = metadata / "asr_fixed.json"
+    _write_asr(asr_file, 2)
+    monkeypatch.setattr(openai_translate, "preprocess", lambda *a, **kw: PreprocessResponse())
+
+    def fake_batch(texts, source, meta, pre, **kw):
+        kw["meta_out"].update(
+            title="好标题",
+            description="这期带你拆解全片。",
+            tags=["影视解说"],
+        )
+        return [
+            openai_translate.TranslationItem(dst="你好。", audio_mode="tts"),
+            openai_translate.TranslationItem(dst="", audio_mode="original", is_ad=True),
+        ]
+
+    monkeypatch.setattr(openai_translate, "translate_batch", fake_batch)
+
+    output = openai_translate.translate_asr(
+        asr_file, tmp_path, _settings(), YT_SOURCE, source_url="https://youtu.be/x"
+    )
+
+    rows = json.loads(output.read_text(encoding="utf-8"))["translation"]
+    assert len(rows) == 2
+    assert "is_ad" not in rows[0]
+    assert rows[1]["is_ad"] is True
+
+    written = openai_translate.load_bilibili_meta(tmp_path)
+    assert written["title"] == "好标题"
+    assert written["source_url"] == "https://youtu.be/x"
+    assert written["tags"] == ["影视解说"]
+    # The source link is appended when the model forgot it.
+    assert "https://youtu.be/x" in written["description"]
+
+
+def test_write_bilibili_meta_needs_a_title_or_a_description(tmp_path):
+    assert openai_translate.write_bilibili_meta(tmp_path) is None
+    assert openai_translate.load_bilibili_meta(tmp_path) is None
+
+    written = openai_translate.write_bilibili_meta(
+        tmp_path, title="标题", source_url="https://youtu.be/x"
+    )
+    assert written is not None
+    data = openai_translate.load_bilibili_meta(tmp_path)
+    assert data["title"] == "标题"
+    assert data["description"] == "原视频：https://youtu.be/x"

@@ -1697,7 +1697,7 @@ def test_upload_japanese_direction_reaches_pipeline_model_parameters(monkeypatch
         output.write_text(asr_file.read_text(encoding="utf-8"), encoding="utf-8")
         return output
 
-    def fake_translate_asr(asr_file, current_session, settings, source):
+    def fake_translate_asr(asr_file, current_session, settings, source, *, source_url=""):
         seen["translation_source"] = (
             source.name,
             source.asr_language,

@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -48,6 +49,21 @@ BULK_MAX_CHARS = 12000
 BULK_ATTEMPTS = 3
 _BULK_LINE_RE = re.compile(r"^\s*(\d+)\s*[\t:：.、]\s*(.*)$")
 
+# The whole-transcript request also returns the Bilibili metadata and the list of
+# ad lines. Both are emitted *before* the (long, truncatable) translation block,
+# so a reply cut short still carries them.
+BULK_SECTION_RE = re.compile(r"^\s*#={2,}\s*(.+?)\s*={2,}\s*$")
+BULK_AD_MARK = "[AD]"
+BULK_SECTION_TITLE = "标题"
+BULK_SECTION_DESC = "简介"
+BULK_SECTION_TAGS = "标签"
+BULK_SECTION_ADS = "广告行号"
+BULK_SECTION_LINES = "逐行译文"
+_AD_RANGE_RE = re.compile(r"(\d+)\s*[-~—－–至]\s*(\d+)")
+_AD_NUM_RE = re.compile(r"\d+")
+_AD_NONE_VALUES = {"", "-", "无", "没有", "none", "null", "n/a", "na", "[]", "（）", "()"}
+_TAG_SPLIT_RE = re.compile(r"[,，、;；#\s]+")
+
 _TRANSIENT_STATUS = {408, 409, 425, 429}
 _QUOTA_MARKERS = (
     "insufficient_user_quota",
@@ -84,12 +100,38 @@ class PreprocessResponse(BaseModel):
 class TranslationItem(BaseModel):
     dst: str
     audio_mode: Literal["tts", "original"]
+    is_ad: bool = False
 
     @model_validator(mode="after")
     def validate_tts_text(self) -> "TranslationItem":
         if self.audio_mode == "tts" and not self.dst.strip():
             raise ValueError("dst must be non-empty when audio_mode is tts")
         return self
+
+
+@dataclass
+class BulkResult:
+    """Everything a single whole-transcript request returns."""
+
+    lines: dict[int, str] = field(default_factory=dict)
+    ad_lines: set[int] = field(default_factory=set)
+    title: str = ""
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+
+    def merged_ad_lines(self, expected: int) -> set[int]:
+        """Ad indexes from the explicit list, plus any line marked ``[AD]``.
+
+        The explicit list is emitted before the translation block, so it
+        survives truncation; the inline marker is a second witness for replies
+        that were cut off before the header. Validating against ``expected``
+        keeps a hallucinated index from deleting a real sentence.
+        """
+        result = {index for index in self.ad_lines if 1 <= index <= expected}
+        for index, text in self.lines.items():
+            if 1 <= index <= expected and text.strip().upper() == BULK_AD_MARK:
+                result.add(index)
+        return result
 
 
 def _error_body(exc: APIStatusError) -> str:
@@ -278,11 +320,95 @@ def _bulk_payload(texts: list[str]) -> str:
     return "\n".join(f"{index}\t{text}" for index, text in enumerate(texts, start=1))
 
 
-def _bulk_system(source: SourceConfig, meta: dict[str, Any], pre: PreprocessResponse) -> str:
+def _bulk_system(
+    source: SourceConfig,
+    meta: dict[str, Any],
+    pre: PreprocessResponse,
+    source_url: str = "",
+) -> str:
     return BULK_TRANSLATION_PROMPT.format(
         system=_translate_system(source, meta, pre),
+        source_title=str(meta.get("title") or "").strip() or "(unknown)",
+        source_uploader=str(meta.get("uploader") or "").strip() or "(unknown)",
+        source_url=source_url.strip() or "(unknown)",
         payload="",
     ).rstrip()
+
+
+def _split_bulk_sections(raw: str) -> dict[str, str]:
+    """Split a reply on the ``#=== name ===`` headers into {name: body}.
+
+    Everything before the first header is dropped (model preamble), and the
+    header name is whitespace-normalised so a stray space does not lose a
+    section.
+    """
+    sections: dict[str, str] = {}
+    name: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if name is not None and name not in sections:
+            sections[name] = "\n".join(buffer).strip()
+
+    for line in raw.splitlines():
+        match = BULK_SECTION_RE.match(line)
+        if match:
+            flush()
+            name = re.sub(r"\s+", "", match.group(1))
+            buffer = []
+            continue
+        if name is not None:
+            buffer.append(line)
+    flush()
+    return sections
+
+
+def _parse_ad_lines(text: str, expected: int) -> set[int]:
+    """Parse ``3,7,12-14`` into a set of 1-based line numbers.
+
+    Ranges are expanded first, then the remaining bare numbers are collected.
+    Every value is clamped to ``1..expected`` so a hallucinated index cannot
+    delete a sentence that does not exist.
+    """
+    result: set[int] = set()
+    if not text or not text.strip():
+        return result
+    if re.sub(r"\s+", "", text).lower() in _AD_NONE_VALUES:
+        return result
+
+    remainder_parts: list[str] = []
+    cursor = 0
+    for match in _AD_RANGE_RE.finditer(text):
+        remainder_parts.append(text[cursor : match.start()])
+        cursor = match.end()
+        start, end = int(match.group(1)), int(match.group(2))
+        if start > end:
+            start, end = end, start
+        if end - start > expected:
+            continue
+        for number in range(start, end + 1):
+            if 1 <= number <= expected:
+                result.add(number)
+    remainder_parts.append(text[cursor:])
+
+    for match in _AD_NUM_RE.finditer(" ".join(remainder_parts)):
+        number = int(match.group(0))
+        if 1 <= number <= expected:
+            result.add(number)
+    return result
+
+
+def _parse_tags(text: str) -> list[str]:
+    if not text:
+        return []
+    seen: set[str] = set()
+    tags: list[str] = []
+    for raw in _TAG_SPLIT_RE.split(text):
+        tag = raw.strip()
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+    return tags
 
 
 def _parse_bulk_reply(raw: str, expected: int) -> dict[int, str]:
@@ -301,6 +427,29 @@ def _parse_bulk_reply(raw: str, expected: int) -> dict[int, str]:
         if 1 <= number <= expected and number not in result:
             result[number] = match.group(2).strip()
     return result
+
+
+def _parse_bulk(raw: str, expected: int) -> BulkResult:
+    """Parse a whole-transcript reply into translations + metadata + ad lines."""
+    sections = _split_bulk_sections(raw)
+    return BulkResult(
+        lines=_parse_bulk_reply(raw, expected),
+        ad_lines=_parse_ad_lines(sections.get(BULK_SECTION_ADS, ""), expected),
+        title=sections.get(BULK_SECTION_TITLE, "").strip(),
+        description=sections.get(BULK_SECTION_DESC, "").strip(),
+        tags=_parse_tags(sections.get(BULK_SECTION_TAGS, "")),
+    )
+
+
+def _coerce_bulk(value: Any) -> BulkResult | None:
+    """Accept a BulkResult or a bare {index: text} mapping from tests/stubs."""
+    if value is None:
+        return None
+    if isinstance(value, BulkResult):
+        return value
+    if isinstance(value, dict):
+        return BulkResult(lines=value)
+    return None
 
 
 def _call_bulk(client: OpenAI, model: str, system: str, payload: str) -> str:
@@ -332,21 +481,27 @@ def translate_bulk(
     *,
     client: OpenAI,
     model: str,
-) -> dict[int, str] | None:
-    """Translate the whole transcript in a single request.
+    source_url: str = "",
+) -> BulkResult | None:
+    """Ask for everything in a single request.
 
     One request means the model sees every sentence together (consistent
     terminology, names and tone) and there is no concurrency to drop
-    connections. The cost is a long reply that can be truncated, which the
-    numbered-line protocol absorbs: a partial reply still yields every line it
-    did contain, and the caller tops up only the missing ones.
+    connections. It also lets the same call judge which lines are ads and write
+    the Bilibili title/description, because those judgements need the same
+    whole-video context.
 
-    Returns a mapping of 1-based sentence index to translation, or ``None`` when
-    the bulk request cannot be served (too long / endpoint refused), so the
-    caller falls back to per-sentence translation.
+    The cost is a long reply that can be truncated, which the numbered-line
+    protocol absorbs: the metadata and ad list are emitted *before* the
+    translation block, so a cut-off reply still carries them, and every line it
+    did contain survives.
+
+    Returns a :class:`BulkResult`, or ``None`` when the bulk request cannot be
+    served (too long / endpoint refused / unusable reply), so the caller falls
+    back to per-sentence translation.
     """
     if not texts:
-        return {}
+        return BulkResult()
     payload = _bulk_payload(texts)
     if len(payload) > BULK_MAX_CHARS:
         log.info(
@@ -355,7 +510,7 @@ def translate_bulk(
             BULK_MAX_CHARS,
         )
         return None
-    system = _bulk_system(source, meta, pre)
+    system = _bulk_system(source, meta, pre, source_url)
     last_error: Exception | None = None
     for attempt in range(BULK_ATTEMPTS):
         try:
@@ -373,12 +528,14 @@ def translate_bulk(
             if attempt < BULK_ATTEMPTS - 1:
                 time.sleep(_backoff(attempt))
             continue
-        parsed = _parse_bulk_reply(raw, len(texts))
-        if parsed:
+        parsed = _parse_bulk(raw, len(texts))
+        if parsed.lines or parsed.ad_lines:
             log.info(
-                "bulk translate: %d/%d lines parsed from one request",
-                len(parsed),
+                "bulk translate: %d/%d lines, %d ad line(s), title=%r",
+                len(parsed.lines),
                 len(texts),
+                len(parsed.ad_lines),
+                parsed.title[:40],
             )
             return parsed
         log.warning(
@@ -402,6 +559,15 @@ def _fix_translation_item(dst: str) -> TranslationItem:
     if not value:
         return TranslationItem(dst="", audio_mode="original")
     return TranslationItem(dst=value, audio_mode="tts")
+
+
+def _ad_translation_item() -> TranslationItem:
+    """A line the model judged to be an ad.
+
+    It carries no target text and is flagged so the translate stage can drop it
+    (and cut its time span out of the finished video) instead of dubbing it.
+    """
+    return TranslationItem(dst="", audio_mode="original", is_ad=True)
 
 
 def translate_sentence(
@@ -526,6 +692,8 @@ def translate_batch(
     model: str,
     concurrency: int = DEFAULT_CONCURRENCY,
     session: Path | None = None,
+    source_url: str = "",
+    meta_out: dict[str, Any] | None = None,
 ) -> list[TranslationItem]:
     if not texts:
         return []
@@ -563,11 +731,13 @@ def translate_batch(
             counter["done"] += 1
         return item
 
-    # --- Preferred path: one request for the whole transcript ---
-    # Global context gives better terminology/name consistency, and a single
-    # request cannot drop connections the way a 50-way fan-out can. Only the
-    # sentences the bulk reply actually missed are translated individually, so a
-    # truncated reply costs a few calls instead of the whole stage.
+    # --- Preferred path: one request for everything ---
+    # Global context gives better terminology/name consistency, a single request
+    # cannot drop connections the way a 50-way fan-out can, and the same call is
+    # the only place that can judge ads and write the Bilibili copy with full
+    # knowledge of the video. Only the sentences the bulk reply actually missed
+    # are translated individually, so a truncated reply costs a few calls
+    # instead of the whole stage.
     results: list[TranslationItem | None] = [None] * len(texts)
     missing: list[int] = []
     for index, text in enumerate(texts):
@@ -579,12 +749,39 @@ def translate_batch(
 
     if missing:
         bulk_input = [texts[index] for index in missing]
-        bulk = translate_bulk(bulk_input, source, meta, pre, client=client, model=model)
+        bulk = _coerce_bulk(
+            translate_bulk(
+                bulk_input,
+                source,
+                meta,
+                pre,
+                client=client,
+                model=model,
+                source_url=source_url,
+            )
+        )
         if bulk is not None:
+            if meta_out is not None:
+                meta_out["title"] = bulk.title
+                meta_out["description"] = bulk.description
+                meta_out["tags"] = list(bulk.tags)
+            ad_positions = bulk.merged_ad_lines(len(bulk_input))
+            if ad_positions:
+                log.info(
+                    "bulk translate flagged %d of %d line(s) as ads",
+                    len(ad_positions),
+                    len(bulk_input),
+                )
             for position, index in enumerate(missing, start=1):
-                if position not in bulk:
+                if position in ad_positions:
+                    # Ads are cut from the video, so they keep no target text.
+                    # Storing the flag in the cache keeps a re-run from asking
+                    # about isolated ad sentences out of context.
+                    item = _ad_translation_item()
+                elif position in bulk.lines:
+                    item = _fix_translation_item(bulk.lines[position])
+                else:
                     continue
-                item = _fix_translation_item(bulk[position])
                 results[index] = item
                 if cache is not None:
                     cache.put(texts[index], item)
@@ -667,11 +864,68 @@ def _concurrency_from(settings: dict[str, str]) -> int:
     return concurrency
 
 
+def bilibili_meta_path(session: Path) -> Path:
+    return session / "metadata" / "bilibili_meta.json"
+
+
+def load_bilibili_meta(session: Path) -> dict[str, Any] | None:
+    path = bilibili_meta_path(session)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("ignoring unreadable Bilibili metadata %s: %s", path, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_bilibili_meta(
+    session: Path,
+    *,
+    title: str = "",
+    description: str = "",
+    tags: list[str] | None = None,
+    source_url: str = "",
+) -> Path | None:
+    """Persist the upload copy for the Bilibili release.
+
+    The source link is non-negotiable: the model is asked to include it, but a
+    description that forgets it would break the attribution requirement, so it
+    is appended when missing.
+    """
+    title = (title or "").strip()
+    description = (description or "").strip()
+    if not title and not description:
+        return None
+    link = (source_url or "").strip()
+    if link and link not in description:
+        description = f"{description}\n\n原视频：{link}".strip()
+    path = bilibili_meta_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "title": title,
+                "description": description,
+                "tags": list(tags or []),
+                "source_url": link,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def translate_asr(
     asr_file: Path,
     session: Path,
     settings: dict[str, str],
     source: SourceConfig,
+    *,
+    source_url: str = "",
 ) -> Path:
     output_file = session / "metadata" / f"translation.{source.target_language}.json"
     if output_file.exists():
@@ -682,6 +936,7 @@ def translate_asr(
     texts = [u["text"].strip() for u in utterances]
     full_text = _full_text(data, texts)
     meta = _read_meta(session)
+    link = (source_url or str(meta.get("webpage_url") or "")).strip()
 
     api = {key: settings[key] for key in API_SETTING_KEYS if key in settings}
     pre = load_preprocess_artifact(session)
@@ -691,6 +946,7 @@ def translate_asr(
         log.info("Wrote translation preprocess artifact to %s", preprocess_artifact_path(session))
     else:
         log.info("Reusing translation preprocess artifact from %s", preprocess_artifact_path(session))
+    meta_out: dict[str, Any] = {}
     translated_items = translate_batch(
         texts,
         source,
@@ -699,10 +955,23 @@ def translate_asr(
         **api,
         concurrency=_concurrency_from(settings),
         session=session,
+        source_url=link,
+        meta_out=meta_out,
     )
+    if meta_out.get("title") or meta_out.get("description"):
+        written = write_bilibili_meta(
+            session,
+            title=meta_out.get("title", ""),
+            description=meta_out.get("description", ""),
+            tags=meta_out.get("tags") or [],
+            source_url=link,
+        )
+        if written is not None:
+            log.info("Wrote Bilibili upload copy to %s", written)
 
-    translation = [
-        {
+    translation: list[dict[str, Any]] = []
+    for text, translated, utt in zip(texts, translated_items, utterances):
+        entry: dict[str, Any] = {
             "src": text,
             "dst": translated.dst,
             "audio_mode": translated.audio_mode,
@@ -712,8 +981,10 @@ def translate_asr(
             "end_time": utt["end_time"],
             "speaker": _speaker(utt),
         }
-        for text, translated, utt in zip(texts, translated_items, utterances)
-    ]
+        if translated.is_ad:
+            # Flagged lines are removed (and cut out of the video) by ad_cut.
+            entry["is_ad"] = True
+        translation.append(entry)
     output_file.write_text(
         json.dumps({"translation": translation}, ensure_ascii=False, indent=2),
         encoding="utf-8",

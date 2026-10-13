@@ -106,6 +106,21 @@ def _silence(seconds: float, sample_rate: int) -> np.ndarray:
     return np.zeros(int(seconds * sample_rate), dtype=np.float32)
 
 
+def _output_span(segment: dict) -> tuple[float, float]:
+    """Where the segment sits on the *finished* timeline.
+
+    ``start_time``/``end_time`` address the source video; when the translate
+    stage cut ad breaks out, the output timeline is shorter and every segment
+    carries the re-mapped ``out_*`` pair. Laying the dubbing out on the source
+    timestamps would silently shift everything after the first cut.
+    """
+    start = segment.get("out_start_time")
+    end = segment.get("out_end_time")
+    if start is None or end is None:
+        return float(segment["start_time"]), float(segment["end_time"])
+    return float(start), float(end)
+
+
 def merge_tts_audio(translation_file: Path, tts_dir: Path, session: Path) -> tuple[Path, Path]:
     dubbing_file = session / "tmp" / "audio_dubbing.wav"
     timings_file = session / "metadata" / "timings.json"
@@ -129,8 +144,9 @@ def merge_tts_audio(translation_file: Path, tts_dir: Path, session: Path) -> tup
     final_audio = np.zeros(0, dtype=np.float32)
     last_end_ms = 0.0
     for segment, tts_file in zip(translation, tts_files):
+        out_start_ms, out_end_ms = _output_span(segment)
         last_end_ms = final_audio.shape[0] / sample_rate * 1000.0
-        real_start_ms = max(float(segment["start_time"]), last_end_ms)
+        real_start_ms = max(out_start_ms, last_end_ms)
         if real_start_ms > last_end_ms:
             final_audio = np.concatenate(
                 [final_audio, _silence((real_start_ms - last_end_ms) / 1000.0, sample_rate)]
@@ -141,19 +157,13 @@ def merge_tts_audio(translation_file: Path, tts_dir: Path, session: Path) -> tup
             y = _resample(y, source_rate, sample_rate)
             desired_samples = max(
                 0,
-                int(
-                    round(
-                        (segment["end_time"] - segment["start_time"])
-                        * sample_rate
-                        / 1000
-                    )
-                ),
+                int(round((out_end_ms - out_start_ms) * sample_rate / 1000)),
             )
             y = y[:desired_samples]
             real_end_ms = real_start_ms + len(y) / sample_rate * 1000.0
         else:
             current_sec, _ = _audio_duration(tts_file)
-            desired_sec = (segment["end_time"] - real_start_ms) / 1000.0
+            desired_sec = (out_end_ms - real_start_ms) / 1000.0
             speed = base * _local_factor(current_sec, base, desired_sec)
             target_sec = current_sec * speed
             y, source_rate = _stretch_segment(tts_file, speed, target_sec, cache_dir)
@@ -161,7 +171,7 @@ def merge_tts_audio(translation_file: Path, tts_dir: Path, session: Path) -> tup
             adjusted_sec = len(y) / sample_rate
             real_end_ms = max(
                 real_start_ms + adjusted_sec * 1000.0,
-                float(segment["end_time"]),
+                out_end_ms,
             )
 
         final_audio = np.concatenate([final_audio, y])

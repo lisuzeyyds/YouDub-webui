@@ -12,7 +12,11 @@ STAGE_OWN_ARTIFACTS: dict[str, tuple[str, ...]] = {
     "separate": ("media/audio_vocals.wav", "media/audio_bgm.wav"),
     "asr": ("metadata/asr.json",),
     "asr_fix": ("metadata/asr_fixed.json",),
-    "translate": ("metadata/translation_preprocess.json",),
+    "translate": (
+        "metadata/translation_preprocess.json",
+        "metadata/bilibili_meta.json",
+        "metadata/ad_cut.json",
+    ),
     "split_audio": ("segments/vocals",),
     "tts": ("segments/tts",),
     "merge_audio": ("tmp/audio_dubbing.wav", "metadata/timings.json", "segments/stretched"),

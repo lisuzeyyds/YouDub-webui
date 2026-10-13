@@ -16,11 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, SecretStr
 
-from . import auth, database, runtime_security, worker, worker_selfheal
+from . import ad_cut, auth, database, runtime_security, worker, worker_selfheal
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_client import validate_openai_base_url
 from .adapters.openai_translate import list_models as list_openai_models
+from .adapters.openai_translate import load_bilibili_meta
 from .config import WORKFOLDER, YOUTUBE_COOKIE_PATH, ensure_runtime_dirs
 from .pipeline import run_task
 from .runtime_checks import validate_runtime_device
@@ -518,12 +519,34 @@ def list_tasks(
     )
 
 
+def _with_upload_copy(task: dict) -> dict:
+    """Attach the generated Bilibili copy and the ad-cut summary.
+
+    Both are written into the session directory by the translate stage, so they
+    are read on demand and simply omitted while a task has no session yet.
+    """
+    session_path = task.get("session_path")
+    if not session_path:
+        return task
+    session = Path(session_path)
+    if not session.exists():
+        return task
+    extra: dict = {}
+    bilibili = load_bilibili_meta(session)
+    if bilibili:
+        extra["bilibili"] = bilibili
+    plan = ad_cut.load_cut_plan(session)
+    if plan:
+        extra["ad_cut"] = plan
+    return {**task, **extra} if extra else task
+
+
 @app.get("/api/tasks/{task_id}")
 def task_detail(task_id: str) -> dict:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
-    return task
+    return _with_upload_copy(task)
 
 
 def _is_inside_workfolder(path: Path) -> bool:

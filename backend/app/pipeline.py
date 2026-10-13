@@ -12,12 +12,21 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import audio_mode, database, gpu_memory, memory_guard, runtime_security, worker_selfheal
+from . import (
+    ad_cut,
+    audio_mode,
+    database,
+    gpu_memory,
+    memory_guard,
+    runtime_security,
+    stage_reset,
+    worker_selfheal,
+)
 from .config import WORKFOLDER
 from .devices import device_plan_summary
 from .errors import DeterministicStageError
 from .runtime_checks import validate_runtime_device
-from .sources import detect_source
+from .sources import SourceConfig, detect_source
 from .stages import STAGES
 from .youtube import is_local_upload_url
 
@@ -605,17 +614,55 @@ class PipelineRunner:
             "translate",
             f"Using model {settings['model']} at {settings['base_url']} ({source.asr_language}->{source.target_language})",
         )
-        self.artifacts.translation_file = translate_asr(asr_file, session, settings, source)
+        self.artifacts.translation_file = translate_asr(
+            asr_file,
+            session,
+            settings,
+            source,
+            source_url=str(task.get("url") or ""),
+        )
         items = _json.loads(self.artifacts.translation_file.read_text(encoding="utf-8"))["translation"]
         self.stage_message(
             "translate",
             f"Translated {len(items)} sentences -> {self.artifacts.translation_file.name}",
         )
+        self._cut_ads(session, source)
         from .adapters.openai_translate import preprocess_artifact_path
 
         preprocess_file = preprocess_artifact_path(session)
         if preprocess_file.exists():
             self.log(f"[translate] Preprocess artifact -> {preprocess_file}")
+
+    def _cut_ads(self, session: Path, source: SourceConfig) -> None:
+        """Drop promo lines and record the video spans to cut out.
+
+        The bulk translate request flags promo sentences (sponsor reads,
+        subscribe prompts, affiliate pitches). They are worthless in a
+        re-upload, so they are removed from the subtitle/dubbing timeline and
+        their time span is cut out of the finished video.
+        """
+        from .adapters.audio import audio_duration_ms
+
+        translation_file = _require(self.artifacts.translation_file, "translation_file")
+        vocals_file = session / "media" / "audio_vocals.wav"
+        duration_ms = audio_duration_ms(vocals_file) if vocals_file.exists() else None
+        report = ad_cut.apply_ad_cut(translation_file, session, duration_ms=duration_ms)
+        if not report.changed:
+            return
+        self.log(
+            f"[translate] Removed {len(report.removed)} ad/promo line(s) "
+            f"across {len(report.spans)} break(s); {report.cut_ms / 1000:.1f}s to cut"
+        )
+        if report.skipped_reason:
+            self.log(
+                f"[translate] Video cut skipped, ads only removed from the audio: "
+                f"{report.skipped_reason}"
+            )
+            return
+        # Cutting ads rewrites the timeline and renumbers the segments, so every
+        # artifact built from the old numbering or timestamps is now wrong.
+        stage_reset.remove_stage_artifacts(session, "split_audio", source)
+        self.log("[translate] Cleared downstream stages so they rebuild on the cut timeline")
 
     def _split_audio(self, _: dict) -> None:
         from .adapters.audio import split_audio_by_translation
@@ -698,6 +745,7 @@ class PipelineRunner:
             dubbing_file = _require(self.artifacts.dubbing_file, "dubbing_file")
             bgm_file = _require(self.artifacts.bgm_file, "bgm_file")
             subtitle_source = _require(self.artifacts.timings_file, "timings_file")
+        cut_spans = ad_cut.load_cut_spans(session)
         self.artifacts.final_video = merge_video(
             video_file,
             dubbing_file,
@@ -705,7 +753,14 @@ class PipelineRunner:
             subtitle_source,
             session,
             output_mode=output_mode,
+            cut_spans=cut_spans,
         )
+        if cut_spans:
+            cut_ms = sum(end - start for start, end in cut_spans)
+            self.log(
+                f"[merge_video] Cut {len(cut_spans)} ad break(s) out of the video "
+                f"({cut_ms / 1000:.1f}s removed)"
+            )
         size_mb = self.artifacts.final_video.stat().st_size / (1024 * 1024)
         self.stage_message("merge_video", f"Final video: {self.artifacts.final_video} ({size_mb:.1f} MB)")
 

@@ -134,8 +134,12 @@ def test_merge_video_stage_uses_translation_and_original_audio_for_subtitles(mon
     runner.artifacts.video_file = video
     runner.artifacts.translation_file = translation
     received: dict[str, object] = {}
+    cut_spans_seen: list[object] = []
 
-    def fake_merge_video(video_file, dubbing_file, bgm_file, timings_file, session_dir, *, output_mode):
+    def fake_merge_video(
+        video_file, dubbing_file, bgm_file, timings_file, session_dir, *, output_mode, cut_spans=None
+    ):
+        cut_spans_seen.append(cut_spans)
         received.update(
             video_file=video_file,
             dubbing_file=dubbing_file,
@@ -160,6 +164,8 @@ def test_merge_video_stage_uses_translation_and_original_audio_for_subtitles(mon
         "session_dir": session,
         "output_mode": "subtitles",
     }
+    # No ad plan on disk -> nothing to cut.
+    assert cut_spans_seen == [[]]
 
 
 def test_manual_subtitles_continue_skips_inapplicable_stages_and_finishes(monkeypatch, tmp_path):

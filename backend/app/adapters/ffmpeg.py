@@ -203,9 +203,16 @@ def _allocate_durations(fragments: list[str], total_duration: int) -> list[int]:
 
 
 def _segment_times(item: dict) -> tuple[int, int]:
-    start = int(item.get("actual_start_time", item["start_time"]))
-    end = int(item.get("actual_end_time", item["end_time"]))
-    return start, end
+    # actual_* is written by merge_tts_audio and already lives on the finished
+    # timeline; out_* is the same timeline before stretching; start/end is the
+    # source video. Fall back in that order.
+    start = item.get("actual_start_time", item.get("out_start_time"))
+    end = item.get("actual_end_time", item.get("out_end_time"))
+    if start is None:
+        start = item["start_time"]
+    if end is None:
+        end = item["end_time"]
+    return int(start), int(end)
 
 
 def _dst_lang(translation: list[dict]) -> str:
@@ -238,6 +245,62 @@ def write_srt(translation_file: Path, session: Path) -> Path:
             idx += 1
     output_file.write_text("\n".join(lines), encoding="utf-8")
     return output_file
+
+
+def probe_has_audio(video_file: Path) -> bool:
+    """Whether the file carries at least one audio stream."""
+    result = subprocess.run(
+        [
+            ffprobe_binary(),
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(video_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def build_cut_expression(spans: list[tuple[int, int]]) -> str:
+    """A ``select``/``aselect`` expression that keeps everything *but* ``spans``.
+
+    Judging each frame against its own source timestamp (instead of re-timing
+    the keeps) means the per-cut frame rounding never accumulates: only the very
+    end of the output can drift by one frame.
+    """
+    clauses = "+".join(
+        f"between(t,{start / 1000:.3f},{end / 1000:.3f})" for start, end in spans
+    )
+    return f"not({clauses})"
+
+
+def build_cut_chains(
+    cut_spans: list[tuple[int, int]],
+    *,
+    subtitle_filter_str: str | None = None,
+    audio_source: str | None = None,
+) -> list[str]:
+    """``filter_complex`` chains that remove ``cut_spans`` down to ``[vout]``/``[aout]``.
+
+    Video and audio share the same expression so both sides cut at the same
+    instants and stay in sync. The subtitle overlay runs *after* the video is
+    re-timed, so the burned-in text follows the cut timeline.
+    """
+    expression = build_cut_expression(cut_spans)
+    video = f"[0:v]select='{expression}',setpts=N/FRAME_RATE/TB"
+    if subtitle_filter_str:
+        video += f",{subtitle_filter_str}"
+    chains = [f"{video}[vout]"]
+    if audio_source:
+        chains.append(f"{audio_source}aselect='{expression}',asetpts=N/SR/TB[aout]")
+    return chains
 
 
 def probe_video_size(video_file: Path) -> tuple[int, int] | None:
@@ -309,6 +372,7 @@ def merge_video(
     session: Path,
     *,
     output_mode: str = "both",
+    cut_spans: list[tuple[int, int]] | None = None,
 ) -> Path:
     if output_mode not in {"subtitles", "dubbing", "both"}:
         raise ValueError("output_mode must be one of: subtitles, dubbing, both")
@@ -326,6 +390,11 @@ def merge_video(
 
     session_dir = session.resolve()
     video_input = video_file.resolve()
+
+    # Ad breaks to physically remove (source timestamps, ms).
+    spans = sorted(
+        (int(start), int(end)) for start, end in (cut_spans or []) if int(end) > int(start)
+    )
 
     mixed_audio_output: Path | None = None
     if include_dubbing:
@@ -357,19 +426,48 @@ def merge_video(
         command = [ffmpeg_binary(), "-y", "-i", str(video_input)]
         if mixed_audio_output is not None:
             command.extend(["-i", str(mixed_audio_output)])
-        if include_subtitles:
-            subtitles = write_srt(timings_file, session)
-            command.extend(["-vf", subtitle_filter(video_input, subtitles, session_dir)])
-        command.extend(["-map", "0:v:0"])
-        if mixed_audio_output is not None:
-            command.extend(["-map", "1:a:0"])
+        subtitles = write_srt(timings_file, session) if include_subtitles else None
+
+        if spans:
+            # One filtergraph removes the ad breaks from the video *and* the
+            # audio at the same instants, then burns the subtitles onto the
+            # already-re-timed video so the text follows the cut timeline.
+            audio_source = "[1:a]" if mixed_audio_output is not None else (
+                "[0:a]" if probe_has_audio(video_input) else None
+            )
+            subtitle_str = (
+                subtitle_filter(video_input, subtitles, session_dir)
+                if subtitles is not None
+                else None
+            )
+            chains = build_cut_chains(
+                spans,
+                subtitle_filter_str=subtitle_str,
+                audio_source=audio_source,
+            )
+            command.extend(["-filter_complex", ";".join(chains), "-map", "[vout]"])
+            if audio_source is not None:
+                command.extend(["-map", "[aout]"])
+            command.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+            if audio_source is not None:
+                command.extend(["-c:a", "aac"])
+            command.extend(["-movflags", "+faststart"])
+            if audio_source is not None:
+                # Frame-accurate cuts leave video and audio a frame apart.
+                command.append("-shortest")
         else:
-            command.extend(["-map", "0:a?"])
-        command.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
-        command.extend(["-c:a", "aac"])
-        command.extend(["-movflags", "+faststart"])
-        if mixed_audio_output is not None:
-            command.append("-shortest")
+            if subtitles is not None:
+                command.extend(["-vf", subtitle_filter(video_input, subtitles, session_dir)])
+            command.extend(["-map", "0:v:0"])
+            if mixed_audio_output is not None:
+                command.extend(["-map", "1:a:0"])
+            else:
+                command.extend(["-map", "0:a?"])
+            command.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+            command.extend(["-c:a", "aac"])
+            command.extend(["-movflags", "+faststart"])
+            if mixed_audio_output is not None:
+                command.append("-shortest")
         command.append(str(temporary_video.resolve()))
         _run_ffmpeg(command, cwd=session_dir)
         temporary_video.replace(final_video)

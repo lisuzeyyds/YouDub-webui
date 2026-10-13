@@ -288,9 +288,16 @@ def test_merge_video_failure_cleans_temporary_output_and_preserves_visible_failu
     final_video = media_dir / "video_final.mp4"
     final_video.write_bytes(b"corrupt")
 
+    real_run = subprocess.run
+
     def fake_run(cmd, **kwargs):
         if cmd[0] == "ffprobe":
             return subprocess.CompletedProcess(cmd, 0, stdout="1920,1080\n", stderr="")
+        if "ffmpeg" not in str(cmd[0]):
+            # Only the ffmpeg binary is faked here. Everything else (e.g. the
+            # harness' own helper processes) must run for real, otherwise
+            # monkeypatching subprocess.run globally breaks them.
+            return real_run(cmd, **kwargs)
         Path(cmd[-1]).write_bytes(b"partial")
         raise subprocess.CalledProcessError(1, cmd)
 
