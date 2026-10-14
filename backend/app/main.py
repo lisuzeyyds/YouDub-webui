@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, SecretStr
 
-from . import ad_cut, auth, database, runtime_security, worker, worker_selfheal
+from . import ad_cut, auth, backend_lock, database, runtime_security, worker, worker_selfheal
 from .adapters.bilibili import load_publish_result
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
@@ -146,10 +146,22 @@ async def lifespan(app: FastAPI):
     database.init_db()
     database.delete_expired_auth_sessions(database.now_iso())
     database.backfill_titles_from_metadata()
-    database.fail_stale_active_tasks()
-    # A previous worker may have exited because it could no longer spawn
-    # ffmpeg; a fresh process can, so pick that task back up automatically.
-    self_healed_task = worker_selfheal.take_pending_resume()
+    # Uvicorn runs this lifespan before binding :8000, so a duplicate uvicorn
+    # (second supervisor loop) reaches this point too. Only the process that
+    # owns the runtime lock may do "previous backend died" bookkeeping;
+    # otherwise the duplicate marks running tasks as failed out from under
+    # the live worker.
+    if backend_lock.claim():
+        database.fail_stale_active_tasks()
+        # A previous worker may have exited because it could no longer spawn
+        # ffmpeg; a fresh process can, so pick that task back up automatically.
+        self_healed_task = worker_selfheal.take_pending_resume()
+    else:
+        logger.warning(
+            "Another backend process owns the runtime lock; "
+            "skipping stale-task cleanup (duplicate uvicorn)."
+        )
+        self_healed_task = None
     worker.start(run_task)
     if self_healed_task:
         worker.enqueue(self_healed_task)

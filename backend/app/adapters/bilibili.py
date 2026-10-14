@@ -260,14 +260,18 @@ def publish_video(
     if cover_file is None:
         log.warning("publishing without a cover (frame extraction failed)")
 
-    shot_dir = session / "tmp" / "bilibili_shots"
+    shot_dir = (session / "tmp" / "bilibili_shots").resolve()
     shot_dir.mkdir(parents=True, exist_ok=True)
-    payload_file = session / "tmp" / "bilibili_payload.json"
+    # The browser script runs with the script directory as its working
+    # directory, so every path handed to it has to be absolute - a relative
+    # one would be resolved against tools/bili-publish/ and the payload file
+    # itself would not even be found (ENOENT on the first live run).
+    payload_file = (session / "tmp" / "bilibili_payload.json").resolve()
     payload_file.write_text(
         json.dumps(
             {
-                "video": str(video_file),
-                "cover": str(cover_file) if cover_file else "",
+                "video": str(video_file.resolve()),
+                "cover": str(cover_file.resolve()) if cover_file else "",
                 "title": title,
                 "description": description,
                 "tags": list(tags),
@@ -276,7 +280,7 @@ def publish_video(
                 "declare": declare,
                 "chrome": chrome,
                 "node": node,
-                "profile": profile,
+                "profile": str(Path(profile).resolve()),
                 "headless": not dry_run,
                 "dryRun": dry_run,
                 "shotDir": str(shot_dir),
