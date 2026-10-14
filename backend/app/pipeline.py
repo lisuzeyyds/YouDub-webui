@@ -540,35 +540,9 @@ class PipelineRunner:
             )
         self.artifacts.session = session
         self.artifacts.video_file = session / "media" / "video_source.mp4"
-        self._warn_on_low_resolution(self.artifacts.video_file)
         title = (info.get("title") or "").strip() or None
         database.update_task(self.task_id, session_path=str(session), title=title)
         self.stage_message("download", f"[{source.name}] {title or 'Downloaded'} -> {session}")
-
-    #: A source below this height is almost certainly a silent format fallback:
-    #: YouTube serves 360p when the better streams cannot be fetched, and the
-    #: downloader then succeeds - on a worse master than anyone asked for.
-    MIN_SOURCE_HEIGHT = 720
-
-    def _warn_on_low_resolution(self, video_file: Path) -> None:
-        """Put a low-resolution download in the task log instead of shipping it
-        silently. One task produced a 360p master this way, and the first sign
-        was the finished upload."""
-        try:
-            from .adapters.ffmpeg import probe_video_size
-
-            size = probe_video_size(video_file)
-        except Exception:  # noqa: BLE001 - a probe failure must not fail the stage
-            return
-        if not size:
-            return
-        width, height = size
-        if height and height < self.MIN_SOURCE_HEIGHT:
-            self.log(
-                f"[download] video_source.mp4 is only {width}x{height} - the "
-                "download fell back to a low-resolution format. Delete "
-                "media/video_source.mp4 and resume to try again."
-            )
 
     def _separate(self, _: dict) -> None:
         from .adapters.demucs import separate_audio
