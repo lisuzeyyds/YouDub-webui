@@ -171,10 +171,18 @@ def test_remove_partial_outputs_clears_format_suffixed_leftovers(tmp_path):
     video_file.write_bytes(b"finished")
     leftover = tmp_path / "video_source.f399.mp4.part"
     leftover.write_bytes(b"partial")
+    marker = tmp_path / "video_source.ytdl"
+    marker.write_bytes(b"state")
+    # A kept backup is not a download artifact and must survive: an earlier
+    # wider pattern deleted one during a failed re-download.
+    backup = tmp_path / "video_source.360p.mp4"
+    backup.write_bytes(b"backup")
 
     ytdlp._remove_partial_outputs(video_file)
 
     assert not leftover.exists()
+    assert not marker.exists()
+    assert backup.read_bytes() == b"backup"
     # The finished file itself is never touched.
     assert video_file.read_bytes() == b"finished"
 

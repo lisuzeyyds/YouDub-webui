@@ -104,9 +104,11 @@ def _is_format_unavailable(exc: Exception) -> bool:
 def _remove_partial_outputs(video_file: Path) -> None:
     # yt-dlp inserts the format id before the extension when it downloads a
     # video-only stream (``video_source.f399.mp4.part``), so matching on the
-    # bare file name misses exactly the big leftovers this is here to clear.
+    # bare file name missed exactly the big leftovers this is here to clear.
+    # Keep the net narrow, though: only download artifacts are ours to delete -
+    # a wider pattern once ate a kept backup sitting next to the target.
     for candidate in video_file.parent.glob(f"{video_file.stem}*"):
-        if candidate == video_file:
+        if candidate == video_file or candidate.suffix not in {".part", ".ytdl"}:
             continue
         if candidate.is_file():
             candidate.unlink(missing_ok=True)
