@@ -307,7 +307,14 @@ async function uploadVideo(page) {
     log('a finished upload is already on the page (draft restored); reusing it');
     return;
   }
-  await page.waitForSelector('input[type=file]', { timeout: 90000 });
+  // Bilibili drives the upload from a custom control and keeps the real
+  // <input type=file> hidden, so it is never "visible" - wait for it to be
+  // attached instead. It is handed the file through CDP below, which does not
+  // care about visibility.
+  await page.waitForSelector('input[type=file][accept*="mp4"]', {
+    state: 'attached',
+    timeout: 90000,
+  });
   await sleep(2000);
 
   const client = await context.newCDPSession(page);
@@ -351,11 +358,13 @@ async function submit(page) {
   fail('submit', 'timed out waiting for the submission result');
 }
 
-async function readBvid(page) {
-  stage = 'bvid';
-  const clicked = await clickExact(page, '查看进度');
-  if (clicked) await sleep(6000);
-  const bvid = await page.evaluate(() => {
+function bvidFromText(text) {
+  const match = (text || '').match(/BV[0-9A-Za-z]{10}/);
+  return match ? match[0] : '';
+}
+
+async function bvidOnPage(page) {
+  return page.evaluate(() => {
     const link = document.querySelector('a[href*="/video/BV"]');
     if (link) {
       const match = link.href.match(/BV[0-9A-Za-z]{10}/);
@@ -364,6 +373,47 @@ async function readBvid(page) {
     const match = (document.body.innerText || '').match(/BV[0-9A-Za-z]{10}/);
     return match ? match[0] : '';
   });
+}
+
+async function readBvid(page) {
+  stage = 'bvid';
+  let bvid = await bvidOnPage(page);
+  if (!bvid) {
+    const clicked = await clickExact(page, '查看进度');
+    if (clicked) {
+      await sleep(6000);
+      bvid = await bvidOnPage(page);
+    }
+  }
+  if (!bvid) {
+    // The success screen does not always expose the id. The upload manager
+    // lists the newest submission first - match the title we just sent, and
+    // fall back to the first row so the id still gets recorded.
+    try {
+      await page.goto('https://member.bilibili.com/platform/upload-manager/article', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await sleep(6000);
+      const rows = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('a[href*="/video/BV"]')).map((link) => ({
+          href: link.href,
+          text: (link.innerText || '').trim(),
+          row: ((link.closest('.video-card, .article-card, .video-item, tr, li') || {}).innerText || '')
+            .replace(/\s+/g, ' ')
+            .trim(),
+        })),
+      );
+      const wanted = (title || '').replace(/\s+/g, '');
+      const match = wanted
+        ? rows.find((row) => (row.row + row.text).replace(/\s+/g, '').includes(wanted.slice(0, 12)))
+        : null;
+      bvid = bvidFromText((match || rows[0] || {}).href);
+      if (bvid) log(`bvid ${bvid} (from the upload manager)`);
+    } catch (error) {
+      log(`could not read the upload manager for the id: ${error.message}`);
+    }
+  }
   if (bvid) log(`bvid ${bvid}`);
   else log('bvid not found on the page; the submission itself succeeded');
   return bvid;
