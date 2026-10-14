@@ -403,6 +403,32 @@ def merge_video(
         dubbing_input = dubbing_file.resolve()
         bgm_input = bgm_file.resolve()
         mixed_audio_output = (tmp_dir / "audio_mixed.m4a").resolve()
+        if spans:
+            # The dubbing track already lives on the *finished* timeline:
+            # merge_tts_audio lays every segment out on its out_* timestamps,
+            # which are the post-cut ones. Only the background track still
+            # addresses the source video, so only it may be cut here. Cutting
+            # the mix instead re-applied the source-timeline spans to dubbing
+            # that had already been re-timed, which shifted everything after
+            # the first ad break by its length - measured on a real task: the
+            # dubbing ran 58s ahead of the burned-in subtitles (and the
+            # picture) from the 107s mark on.
+            bgm_input = (tmp_dir / "audio_bgm_cut.m4a").resolve()
+            _run_ffmpeg(
+                [
+                    ffmpeg_binary(),
+                    "-y",
+                    "-i",
+                    str(bgm_file.resolve()),
+                    "-filter_complex",
+                    f"[0:a]aselect='{build_cut_expression(spans)}',asetpts=N/SR/TB[aout]",
+                    "-map",
+                    "[aout]",
+                    "-c:a",
+                    "aac",
+                    str(bgm_input),
+                ],
+            )
         _run_ffmpeg(
             [
                 ffmpeg_binary(),
@@ -429,12 +455,16 @@ def merge_video(
         subtitles = write_srt(timings_file, session) if include_subtitles else None
 
         if spans:
-            # One filtergraph removes the ad breaks from the video *and* the
-            # audio at the same instants, then burns the subtitles onto the
-            # already-re-timed video so the text follows the cut timeline.
-            audio_source = "[1:a]" if mixed_audio_output is not None else (
-                "[0:a]" if probe_has_audio(video_input) else None
-            )
+            # Only the picture is re-timed here. With dubbing, both audio inputs
+            # are already on the cut timeline (the dubbing track is authored on
+            # it, the BGM was cut before mixing) - running the source-timeline
+            # selection over them again is what shifted the dubbing ahead of
+            # the subtitles by the first break's length. Without dubbing, the
+            # video's own audio still addresses the source and is cut with it.
+            if mixed_audio_output is not None:
+                audio_source = None
+            else:
+                audio_source = "[0:a]" if probe_has_audio(video_input) else None
             subtitle_str = (
                 subtitle_filter(video_input, subtitles, session_dir)
                 if subtitles is not None
@@ -446,13 +476,15 @@ def merge_video(
                 audio_source=audio_source,
             )
             command.extend(["-filter_complex", ";".join(chains), "-map", "[vout]"])
-            if audio_source is not None:
+            if mixed_audio_output is not None:
+                command.extend(["-map", "1:a:0"])
+            elif audio_source is not None:
                 command.extend(["-map", "[aout]"])
             command.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
-            if audio_source is not None:
+            if mixed_audio_output is not None or audio_source is not None:
                 command.extend(["-c:a", "aac"])
             command.extend(["-movflags", "+faststart"])
-            if audio_source is not None:
+            if mixed_audio_output is not None or audio_source is not None:
                 # Frame-accurate cuts leave video and audio a frame apart.
                 command.append("-shortest")
         else:

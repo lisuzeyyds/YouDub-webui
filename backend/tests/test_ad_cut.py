@@ -352,3 +352,57 @@ def test_merge_video_ignores_empty_or_inverted_spans(monkeypatch, tmp_path):
     )
 
     assert "-filter_complex" not in commands[-1]
+
+
+def test_merge_video_never_re_cuts_the_already_re_timed_dubbing(monkeypatch, tmp_path):
+    """The dubbing is authored on the cut timeline and must not be cut again.
+
+    merge_tts_audio lays every segment out on its out_* timestamps, i.e. the
+    post-cut timeline. Running the source-timeline spans over the dubbing a
+    second time shifted the whole track ahead of the burned-in subtitles by the
+    length of the first break - 58s on the task that exposed this, which is
+    exactly what "subtitles and speech do not line up" looked like. Only the
+    BGM still addresses the source video, so only it may be cut here.
+    """
+    session = tmp_path / "session"
+    for directory in ("metadata", "media", "tmp"):
+        (session / directory).mkdir(parents=True, exist_ok=True)
+    translation = _write_translation(session, [])
+    dubbing = session / "tmp" / "audio_dubbing.wav"
+    dubbing.write_bytes(b"wav")
+    bgm = session / "media" / "audio_bgm.wav"
+    bgm.write_bytes(b"wav")
+    commands: list[list[str]] = []
+
+    def fake_ffmpeg(cmd, **kwargs):
+        commands.append(cmd)
+        Path(cmd[-1]).write_bytes(b"mp4")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(ffmpeg, "_run_ffmpeg", fake_ffmpeg)
+
+    ffmpeg.merge_video(
+        tmp_path / "video.mp4",
+        dubbing,
+        bgm,
+        translation,
+        session,
+        output_mode="both",
+        cut_spans=[(1000, 2000)],
+    )
+
+    # The background track is cut on its own, because only it still addresses
+    # the source video...
+    bgm_cut = next(cmd for cmd in commands if any("audio_bgm_cut" in part for part in cmd))
+    bgm_graph = bgm_cut[bgm_cut.index("-filter_complex") + 1]
+    assert "aselect='not(between(t,1.000,2.000))'" in bgm_graph
+
+    # ...and the render re-times the picture only: no second audio selection,
+    # the already-cut mix is mapped through untouched.
+    final = commands[-1]
+    graph = final[final.index("-filter_complex") + 1]
+    assert "select='not(between(t,1.000,2.000))'" in graph
+    assert "aselect=" not in graph
+    assert final[final.index("-map") + 1] == "[vout]"
+    assert "1:a:0" in final
+    assert "-shortest" in final

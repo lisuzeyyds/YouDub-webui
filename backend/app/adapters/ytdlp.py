@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ from .. import runtime_security
 from ..sanitize import sanitize_text
 from ..sources import SourceConfig
 from ..youtube import extract_video_id, validate_video_url
+
+log = logging.getLogger(__name__)
 
 
 FORMAT_CANDIDATES = (
@@ -99,7 +102,10 @@ def _is_format_unavailable(exc: Exception) -> bool:
 
 
 def _remove_partial_outputs(video_file: Path) -> None:
-    for candidate in video_file.parent.glob(f"{video_file.name}*"):
+    # yt-dlp inserts the format id before the extension when it downloads a
+    # video-only stream (``video_source.f399.mp4.part``), so matching on the
+    # bare file name misses exactly the big leftovers this is here to clear.
+    for candidate in video_file.parent.glob(f"{video_file.stem}*"):
         if candidate == video_file:
             continue
         if candidate.is_file():
@@ -110,7 +116,7 @@ def _download_with_format_candidates(
     url: str, video_file: Path, source: SourceConfig, proxy_port: str
 ) -> None:
     last_error: Exception | None = None
-    for format_selector in FORMAT_CANDIDATES:
+    for index, format_selector in enumerate(FORMAT_CANDIDATES):
         download_opts = {
             **_ydl_base(source, proxy_port),
             "format": format_selector,
@@ -122,10 +128,22 @@ def _download_with_format_candidates(
         try:
             with yt_dlp.YoutubeDL(download_opts) as ydl:
                 ydl.download([url])
+            if index:
+                # Landing on a later candidate means the better ones failed and
+                # this download is a fallback - usually a lower resolution. Say
+                # so out loud: one task shipped a 360p master this way and
+                # nobody knew until the upload was live.
+                log.warning(
+                    "downloaded with fallback format %r after %d candidate(s) failed; "
+                    "the master may be below 1080p",
+                    format_selector,
+                    index,
+                )
             return
         except Exception as exc:
             last_error = exc
             _remove_partial_outputs(video_file)
+            log.warning("download format %r failed: %s", format_selector, str(exc)[:200])
             if not _is_format_unavailable(exc):
                 continue
     if last_error:

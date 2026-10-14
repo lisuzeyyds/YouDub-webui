@@ -158,3 +158,62 @@ def test_download_video_rejects_deceptive_url_before_cookie_or_ytdlp(
         )
 
     assert calls == []
+
+
+def test_remove_partial_outputs_clears_format_suffixed_leftovers(tmp_path):
+    """yt-dlp names a video-only stream ``video_source.f399.mp4.part``.
+
+    Matching the bare file name missed exactly the large leftovers this helper
+    exists for - a real task kept a 233 MB ``video_source.f399.mp4.part``
+    behind after the format candidate it belonged to failed.
+    """
+    video_file = tmp_path / "video_source.mp4"
+    video_file.write_bytes(b"finished")
+    leftover = tmp_path / "video_source.f399.mp4.part"
+    leftover.write_bytes(b"partial")
+
+    ytdlp._remove_partial_outputs(video_file)
+
+    assert not leftover.exists()
+    # The finished file itself is never touched.
+    assert video_file.read_bytes() == b"finished"
+
+
+def test_download_warns_when_it_falls_back_to_a_lower_format(monkeypatch, tmp_path, caplog):
+    """A fallback download must say so - one task shipped a 360p master this way.
+
+    Every candidate up to the last one fails here, so the download lands on
+    ``best`` (which on YouTube is 360p when the better streams are refused).
+    That used to happen entirely silently.
+    """
+    attempts: list[str] = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def download(self, urls):
+            attempts.append(self.options["format"])
+            if len(attempts) < len(ytdlp.FORMAT_CANDIDATES):
+                raise RuntimeError("Requested format is not available")
+            Path(self.options["outtmpl"]).write_bytes(b"video")
+
+    monkeypatch.setattr(ytdlp.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(ytdlp, "_ydl_base", lambda *args, **kwargs: {})
+
+    with caplog.at_level("WARNING"):
+        ytdlp._download_with_format_candidates(
+            "https://www.youtube.com/watch?v=abcdefghijk",
+            tmp_path / "video_source.mp4",
+            _youtube_source(),
+            "",
+        )
+
+    assert attempts == list(ytdlp.FORMAT_CANDIDATES)
+    assert "fallback format" in caplog.text
