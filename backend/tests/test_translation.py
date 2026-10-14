@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import types
 
 import httpx
 import pytest
 from openai import (
     APIConnectionError,
+    APIError,
     AuthenticationError,
     BadRequestError,
     InternalServerError,
@@ -861,6 +863,126 @@ def test_call_bulk_keeps_what_a_broken_stream_already_sent():
     with pytest.raises(openai_translate.PartialReplyError) as info:
         openai_translate._call_bulk(_FakeClient(behaviour), "m", "sys", "payload")
     assert info.value.partial == "1\t你好。\n"
+
+
+def _api_error(message: str) -> APIError:
+    """The bare APIError the SDK raises for an error object inside a stream."""
+    request = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    return APIError(message, request=request, body={"message": message})
+
+
+def test_call_bulk_retries_an_error_object_inside_the_stream():
+    """A relay can answer 200 and then stream an error instead of a chunk.
+
+    The SDK surfaces that as a bare ``APIError`` - the *parent* of
+    APIStatusError and APIConnectionError - so the branches that know about
+    those never see it. A real run died on exactly this ("The service is
+    temporarily unavailable. Please retry later.") with zero retries: the
+    exception walked out of the pipeline and failed the whole task.
+    """
+
+    def halfway(kwargs):
+        def gen():
+            yield _stream_chunk("1\t你好。\n")
+            raise _api_error("The service is temporarily unavailable. Please retry later.")
+
+        return gen()
+
+    with pytest.raises(openai_translate.PartialReplyError) as info:
+        openai_translate._call_bulk(_FakeClient(halfway), "m", "sys", "payload")
+    # Whatever the stream did deliver is kept - that reply took minutes to write.
+    assert info.value.partial == "1\t你好。\n"
+
+    def straight_away(kwargs):
+        return (_ for _ in ()).throw(_api_error("The service is temporarily unavailable."))
+
+    with pytest.raises(TransientApiError):
+        openai_translate._call_bulk(_FakeClient(straight_away), "m", "sys", "payload")
+
+
+def test_call_bulk_keeps_a_deterministic_stream_error_deterministic():
+    """Error text that no retry can fix must still fail fast, not burn attempts."""
+
+    def behaviour(kwargs):
+        return (_ for _ in ()).throw(_api_error("insufficient_user_quota: 余额不足，请充值"))
+
+    with pytest.raises(TranslationApiError):
+        openai_translate._call_bulk(_FakeClient(behaviour), "m", "sys", "payload")
+
+
+def test_call_bulk_gives_up_on_a_stream_that_never_finishes(monkeypatch):
+    """The wall clock has to end a stream the relay keeps holding open.
+
+    A stalled relay is invisible to everything else: the connection is not dead
+    (bytes trickle in, resetting the per-read timeout) and no error arrives, so
+    one real request sat for 27 minutes before the relay finally spoke. Past the
+    deadline the reply is kept and the request is retried instead.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        openai_translate,
+        "time",
+        types.SimpleNamespace(
+            monotonic=lambda: clock["t"], sleep=openai_translate.time.sleep
+        ),
+    )
+    monkeypatch.setattr(openai_translate, "_bulk_timeout_seconds", lambda: 10.0)
+    closed = {"n": 0}
+
+    class Stream:
+        """A streamed response that can be closed, like the SDK's own."""
+
+        def __init__(self, steps):
+            self._steps = list(steps)
+
+        def __iter__(self):
+            # The clock only moves while the stream is being read, which is what
+            # makes a stall mid-reply differ from a slow first byte.
+            while self._steps:
+                moment, chunk = self._steps.pop(0)
+                clock["t"] = moment
+                yield chunk
+
+        def close(self):
+            closed["n"] += 1
+
+    def stalled(kwargs):
+        return Stream(
+            [
+                (1.0, _stream_chunk("1\t你好。\n")),
+                (99.0, _stream_chunk("2\t世界。\n")),
+            ]
+        )
+
+    with pytest.raises(openai_translate.PartialReplyError) as info:
+        openai_translate._call_bulk(_FakeClient(stalled), "m", "sys", "payload")
+    assert info.value.partial == "1\t你好。\n"
+    assert "did not finish" in str(info.value)
+    assert closed["n"] == 1
+
+
+def test_call_bulk_reports_a_stalled_stream_with_nothing_to_keep(monkeypatch):
+    """Same stall, but the relay went quiet before sending anything usable."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        openai_translate,
+        "time",
+        types.SimpleNamespace(
+            monotonic=lambda: clock["t"], sleep=openai_translate.time.sleep
+        ),
+    )
+    monkeypatch.setattr(openai_translate, "_bulk_timeout_seconds", lambda: 10.0)
+
+    def behaviour(kwargs):
+        def gen():
+            clock["t"] = 99.0
+            yield _stream_chunk("1\t你好。\n")
+
+        return gen()
+
+    with pytest.raises(TransientApiError) as info:
+        openai_translate._call_bulk(_FakeClient(behaviour), "m", "sys", "payload")
+    assert "did not finish" in str(info.value)
 
 
 def test_call_bulk_sets_an_explicit_output_cap(monkeypatch):

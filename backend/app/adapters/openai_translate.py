@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -13,6 +14,7 @@ from typing import Any, Iterable, Literal, Sequence
 
 from openai import (
     APIConnectionError,
+    APIError,
     APIStatusError,
     APITimeoutError,
     OpenAI,
@@ -64,6 +66,13 @@ BULK_PARTIAL_MIN_RATIO = 0.25
 # retry. Measured on this relay: the same 542-line request stops after 95 lines
 # without the parameter and returns 513/513 in 210s with it.
 BULK_MAX_TOKENS = 16000
+# Wall-clock cap for one streamed whole-transcript request. A relay hiccup does
+# not necessarily end the stream: the connection stays open with trickle data
+# (which resets httpx's per-read timeout), so nothing tells us the reply is not
+# coming. One real request sat like that for 27 minutes before the relay finally
+# put an error object in the stream. Past this deadline the partial reply is kept
+# and the request is retried, which costs minutes instead of half an hour.
+BULK_REQUEST_TIMEOUT = 600.0
 # A long reply can still end early (stream cut, gateway hiccup). Asking again for
 # just the uncovered tail is one more request; handing the same leftovers to the
 # per-sentence path is 400+ requests and hours.
@@ -100,6 +109,25 @@ _QUOTA_MARKERS = (
     "insufficient_quota",
     "余额不足",
     "quota",
+)
+# Error text a relay puts *inside* the stream (see ``_call_bulk``). Most of those
+# are temporary, but a few mean the request can never succeed as configured and
+# retrying them just burns the attempts before the task fails with a worse
+# message - so they are matched here and reported as deterministic.
+_DETERMINISTIC_ERROR_MARKERS = (
+    "invalid_api_key",
+    "incorrect api key",
+    "no permission",
+    "permission denied",
+    "model_not_found",
+    "does not exist",
+    "not found",
+    "invalid_request",
+    "unsupported",
+    "maximum context",
+    "context_length",
+    "content_policy",
+    "content filter",
 )
 
 
@@ -697,6 +725,33 @@ def _rejects_max_tokens(exc: APIStatusError) -> bool:
     return status == 400 and "max_tokens" in str(exc).lower()
 
 
+def _bulk_timeout_seconds() -> float:
+    """Wall-clock budget for one streamed request (``BULK_REQUEST_TIMEOUT``)."""
+    raw = os.getenv("YOUDUB_BULK_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return BULK_REQUEST_TIMEOUT
+    return value if value > 0 else BULK_REQUEST_TIMEOUT
+
+
+def _close_stream(stream: object) -> None:
+    """Shut a streamed response down without masking the error being raised."""
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - closing must not replace the real error
+            pass
+
+
+def _stream_error_is_deterministic(message: str) -> bool:
+    """Whether error text from inside a stream can never succeed on a retry."""
+    lowered = message.lower()
+    markers = _QUOTA_MARKERS + _DETERMINISTIC_ERROR_MARKERS
+    return any(marker.lower() in lowered for marker in markers)
+
+
 def _call_bulk(client: OpenAI, model: str, system: str, payload: str) -> str:
     """One plain-text completion for the whole transcript, read as a stream.
 
@@ -711,9 +766,23 @@ def _call_bulk(client: OpenAI, model: str, system: str, payload: str) -> str:
     without ``stream``, and completes all 1068 lines in 263s with it.
     """
     parts: list[str] = []
+    timeout = _bulk_timeout_seconds()
+    deadline = time.monotonic() + timeout
     try:
         stream = _open_bulk_stream(client, model, system, payload)
         for chunk in stream:
+            if time.monotonic() > deadline:
+                # The relay accepted the request and is still holding the stream
+                # open, but the reply is not coming. Nothing else stops this: the
+                # per-read timeout only fires when the connection falls silent,
+                # and a trickle of bytes keeps resetting it. The wall clock is
+                # the only guard, and it turns a half-hour hang into a retry.
+                _close_stream(stream)
+                partial = "".join(parts)
+                message = f"the relay did not finish the reply within {timeout:.0f}s"
+                if partial:
+                    raise PartialReplyError(message, partial)
+                raise TransientApiError(message)
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
@@ -736,6 +805,21 @@ def _call_bulk(client: OpenAI, model: str, system: str, payload: str) -> str:
                 raise PartialReplyError(message, partial) from exc
             raise TransientApiError(message) from exc
         raise TranslationApiError(_api_error_message(exc)) from exc
+    except APIError as exc:
+        # The relay answered 200 and then put an error object *inside the SSE
+        # stream* instead of a completion chunk; the SDK surfaces that as a bare
+        # ``APIError``, which is the parent of APIStatusError/APIConnectionError
+        # and therefore invisible to the branches above. Without this branch such
+        # an error walked straight out of the pipeline and failed the task with
+        # no retry at all - even though its text ("The service is temporarily
+        # unavailable. Please retry later.") describes a transient failure.
+        message = str(exc)
+        if _stream_error_is_deterministic(message):
+            raise TranslationApiError(message) from exc
+        partial = "".join(parts)
+        if partial:
+            raise PartialReplyError(message, partial) from exc
+        raise TransientApiError(message) from exc
     return "".join(parts)
 
 

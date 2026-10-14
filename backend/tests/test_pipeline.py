@@ -6,10 +6,13 @@ import sys
 import types
 from pathlib import Path
 
+import httpx
 import pytest
+from openai import APIError
 
 from backend.app import database
 from backend.app import pipeline
+from backend.app.adapters.openai_translate import TranslationApiError
 from backend.app.pipeline import PipelineRunner
 from backend.app.stages import STAGES
 
@@ -40,6 +43,26 @@ def _cached_session(tmp_path: Path) -> Path:
     ):
         (session / file).write_bytes(b"cached")
     return session
+
+
+def test_stage_retry_treats_a_bare_api_error_as_transient():
+    """A relay error that reaches the pipeline must be retried, not fatal.
+
+    The translation adapter reclassifies every API error it recognises - into
+    TransientApiError (retry) or TranslationApiError (deterministic) - so a bare
+    ``openai.APIError`` arriving here means an unrecognised relay-side stall.
+    One real task died on exactly that, with no retry and a bare error message.
+    """
+    request = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    stalled = APIError(
+        "The service is temporarily unavailable. Please retry later.",
+        request=request,
+        body=None,
+    )
+
+    assert pipeline._is_transient_stage_error(stalled)
+    # The deliberate deterministic classification still wins.
+    assert not pipeline._is_transient_stage_error(TranslationApiError("余额不足"))
 
 
 def test_pipeline_marks_all_stages_succeeded(monkeypatch, tmp_path):

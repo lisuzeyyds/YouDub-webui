@@ -12,6 +12,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
+from openai import APIError
+
 from . import (
     ad_cut,
     audio_mode,
@@ -64,6 +66,12 @@ def _is_transient_stage_error(exc: BaseException) -> bool:
         return False
     if isinstance(exc, DeterministicStageError):
         return False
+    # The translation adapter reclassifies the API errors it knows about, so a
+    # bare one reaching this point means the relay stalled on us (an error
+    # object inside an otherwise healthy stream) rather than a broken task.
+    # Retrying is the right answer; failing the whole task is not.
+    if isinstance(exc, APIError):
+        return True
     return isinstance(exc, (RuntimeError, OSError, subprocess.SubprocessError))
 
 
