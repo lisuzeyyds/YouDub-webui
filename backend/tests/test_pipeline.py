@@ -1138,3 +1138,50 @@ def test_transient_stage_errors_are_retried(monkeypatch, tmp_path):
     runner._run_stage("translate")
 
     assert attempts["n"] == 3
+
+
+def test_translate_stage_hands_the_configured_partition_candidates_to_the_prompt(
+    monkeypatch, tmp_path
+):
+    """The candidate lists are what make the model's suggestion usable.
+
+    The prompt asks the model to pick one entry of the configured lists and
+    the reply is matched against them. Passing nothing left them empty, so a
+    real upload went out without a partition or a collection: the suggestion
+    was produced, matched against nothing, and silently dropped.
+    """
+    configure_db(monkeypatch, tmp_path)
+    database.save_bilibili_settings({"zones": "游戏,知识", "collections": "mc,科普"})
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=abcdefghijk", task_id="translateoptions"
+    )
+    session = tmp_path / "session"
+    for directory in ("media", "metadata", "tmp"):
+        (session / directory).mkdir(parents=True, exist_ok=True)
+    asr_file = session / "metadata" / "asr_fixed.json"
+    asr_file.write_text(json.dumps({"result": {"utterances": []}}), encoding="utf-8")
+
+    captured: dict = {}
+
+    def fake_translate_asr(*args, **kwargs):
+        captured.update(kwargs)
+        output = session / "metadata" / "translation.zh.json"
+        output.write_text(json.dumps({"translation": []}), encoding="utf-8")
+        return output
+
+    translate_module = types.ModuleType("backend.app.adapters.openai_translate")
+    translate_module.translate_asr = fake_translate_asr
+    translate_module.preprocess_artifact_path = (
+        lambda session_dir: session_dir / "metadata" / "translation_preprocess.json"
+    )
+    monkeypatch.setitem(sys.modules, "backend.app.adapters.openai_translate", translate_module)
+    monkeypatch.setattr(PipelineRunner, "_cut_ads", lambda self, session_dir, source: None)
+
+    runner = PipelineRunner(task_id)
+    runner.artifacts.session = session
+    runner.artifacts.asr_fixed_file = asr_file
+
+    runner._translate(database.get_task(task_id))
+
+    assert captured["zone_options"] == ["游戏", "知识"]
+    assert captured["collection_options"] == ["mc", "科普"]

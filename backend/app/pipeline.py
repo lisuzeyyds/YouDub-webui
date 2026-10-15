@@ -647,6 +647,7 @@ class PipelineRunner:
 
         asr_file = _require(self.artifacts.asr_fixed_file, "asr_fixed_file")
         settings = database.get_openai_settings()
+        upload_settings = database.get_bilibili_settings()
         self.stage_message(
             "translate",
             f"Using model {settings['model']} at {settings['base_url']} ({source.asr_language}->{source.target_language})",
@@ -657,6 +658,14 @@ class PipelineRunner:
             settings,
             source,
             source_url=str(task.get("url") or ""),
+            # The prompt may only pick a partition or a collection that appears
+            # on these lists. Without them nothing matches and the suggestion
+            # is silently dropped, which is how one upload went out without
+            # either - the lists are what makes the suggestion usable.
+            zone_options=database.bilibili_option_list(upload_settings.get("zones", "")),
+            collection_options=database.bilibili_option_list(
+                upload_settings.get("collections", "")
+            ),
         )
         items = _json.loads(self.artifacts.translation_file.read_text(encoding="utf-8"))["translation"]
         self.stage_message(

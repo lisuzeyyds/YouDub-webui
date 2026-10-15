@@ -98,6 +98,9 @@ BULK_SECTION_ADS = "广告行号"
 BULK_SECTION_LINES = "逐行译文"
 BULK_SECTION_ZONE = "建议分区"
 BULK_SECTION_COLLECTION = "建议合集"
+#: What the model may answer when no collection fits: "leave it unset", not a
+#: name to match against the candidates.
+COLLECTION_NONE_VALUES = ("无", "none", "n/a", "不适用", "没有")
 _AD_RANGE_RE = re.compile(r"(\d+)\s*[-~—－–至]\s*(\d+)")
 _AD_NUM_RE = re.compile(r"\d+")
 _AD_NONE_VALUES = {"", "-", "无", "没有", "none", "null", "n/a", "na", "[]", "（）", "()"}
@@ -656,18 +659,43 @@ def _parse_bulk(
 ) -> BulkResult:
     """Parse a whole-transcript reply into translations + metadata + ad lines."""
     sections = _split_bulk_sections(raw)
+    zone_reply = sections.get(BULK_SECTION_ZONE, "")
+    collection_reply = sections.get(BULK_SECTION_COLLECTION, "")
+    zone = _parse_choice(zone_reply, zone_options)
+    collection = _parse_choice(
+        collection_reply,
+        collection_options,
+        none_values=COLLECTION_NONE_VALUES,
+    )
+    # A suggestion only reaches the upload when it matches a candidate. One
+    # that does not is dropped, so say so - otherwise the upload goes out
+    # without a partition and nothing explains why.
+    if zone_reply.strip() and not zone:
+        log.warning(
+            "the model suggested the partition %r, which is not one of the "
+            "candidates %s; leaving the partition unset",
+            zone_reply.strip()[:60],
+            list(zone_options)[:12] or "(none configured)",
+        )
+    if collection_reply.strip() and not collection:
+        compact = re.sub(r"\s+", "", collection_reply.strip()).lower()
+        if compact not in {
+            re.sub(r"\s+", "", value).lower() for value in COLLECTION_NONE_VALUES
+        }:
+            log.warning(
+                "the model suggested the collection %r, which is not one of the "
+                "candidates %s; leaving the collection unset",
+                collection_reply.strip()[:60],
+                list(collection_options)[:12] or "(none configured)",
+            )
     return BulkResult(
         lines=_parse_bulk_reply(raw, expected),
         ad_lines=_parse_ad_lines(sections.get(BULK_SECTION_ADS, ""), expected),
         title=sections.get(BULK_SECTION_TITLE, "").strip(),
         description=sections.get(BULK_SECTION_DESC, "").strip(),
         tags=_parse_tags(sections.get(BULK_SECTION_TAGS, "")),
-        zone=_parse_choice(sections.get(BULK_SECTION_ZONE, ""), zone_options),
-        collection=_parse_choice(
-            sections.get(BULK_SECTION_COLLECTION, ""),
-            collection_options,
-            none_values=("无", "none", "n/a", "不适用", "没有"),
-        ),
+        zone=zone,
+        collection=collection,
     )
 
 

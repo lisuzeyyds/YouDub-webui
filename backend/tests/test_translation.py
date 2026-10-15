@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import types
 
 import httpx
@@ -1413,6 +1414,44 @@ def test_parse_bulk_reads_the_zone_and_collection_hints():
     assert result.zone == "游戏"
     assert result.collection == ""
     assert result.lines == {1: "你好。"}
+
+
+def test_parse_bulk_warns_when_a_suggestion_matches_no_candidate(caplog):
+    """A dropped suggestion must not be invisible - the upload just had none.
+
+    An empty candidate list makes every suggestion fail to match, which is
+    exactly how a real task uploaded without a partition or a collection.
+    """
+    raw = (
+        "#=== 建议分区 ===\n鬼畜\n"
+        "#=== 建议合集 ===\n科幻\n"
+        "#=== 逐行译文 ===\n1\t你好。\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        result = openai_translate._parse_bulk(
+            raw, 1, zone_options=["游戏"], collection_options=["mc"]
+        )
+
+    assert result.zone == ""
+    assert result.collection == ""
+    assert "鬼畜" in caplog.text
+    assert "科幻" in caplog.text
+
+
+def test_parse_bulk_does_not_warn_when_the_model_answers_none(caplog):
+    raw = (
+        "#=== 建议分区 ===\n游戏\n"
+        "#=== 建议合集 ===\n无\n"
+        "#=== 逐行译文 ===\n1\t你好。\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        result = openai_translate._parse_bulk(
+            raw, 1, zone_options=["游戏"], collection_options=["mc"]
+        )
+
+    assert result.zone == "游戏"
+    assert result.collection == ""
+    assert "not one of the candidates" not in caplog.text
 
 
 def test_translate_batch_flags_ad_lines_and_reports_the_bilibili_copy(monkeypatch):
