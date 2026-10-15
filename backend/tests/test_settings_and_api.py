@@ -1735,7 +1735,19 @@ def test_upload_japanese_direction_reaches_pipeline_model_parameters(monkeypatch
         output.write_text(asr_file.read_text(encoding="utf-8"), encoding="utf-8")
         return output
 
-    def fake_translate_asr(asr_file, current_session, settings, source, *, source_url=""):
+    def fake_translate_asr(
+        asr_file,
+        current_session,
+        settings,
+        source,
+        *,
+        source_url="",
+        zone_options=(),
+        collection_options=(),
+    ):
+        # The candidates have to travel with the request: the prompt may only
+        # suggest a partition found in this list.
+        assert zone_options, "the partition candidates must reach the request"
         seen["translation_source"] = (
             source.name,
             source.asr_language,
