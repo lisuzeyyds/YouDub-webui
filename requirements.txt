@@ -21,3 +21,5 @@ audiostretchy
 numpy
 pytest
 httpx[socks]
+# Reading the text off a cover (tools/cover_ocr.py); weights ship inside the package.
+rapidocr-onnxruntime
