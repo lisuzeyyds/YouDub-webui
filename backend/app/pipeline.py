@@ -835,6 +835,7 @@ class PipelineRunner:
             zone=(meta.get("zone") or "").strip(),
             collection=(meta.get("collection") or "").strip(),
             settings=database.get_bilibili_settings(),
+            video_id=str(task.get("id") or ""),
         )
         bilibili.publish_artifact_path(session).write_text(
             json.dumps(
@@ -844,6 +845,7 @@ class PipelineRunner:
                     "title": title,
                     "zone": outcome.zone,
                     "collection": outcome.collection,
+                    "cover": Path(outcome.cover).name if outcome.cover else "",
                     "published_at": database.now_iso(),
                 },
                 ensure_ascii=False,

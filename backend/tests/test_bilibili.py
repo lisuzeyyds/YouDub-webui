@@ -24,6 +24,9 @@ def _toolchain(monkeypatch, tmp_path) -> dict[str, str]:
     monkeypatch.setattr(bilibili, "find_node", lambda *_a, **_k: "node")
     monkeypatch.setattr(bilibili, "find_script", lambda *_a, **_k: "publish.js")
     monkeypatch.setattr(bilibili, "build_cover", lambda *_a, **_k: None)
+    # The real one downloads a thumbnail and may call the image API; cover
+    # selection has its own tests in test_cover.py.
+    monkeypatch.setattr(bilibili.cover, "prepare_cover", lambda **_k: None)
     return {"profile_dir": str(tmp_path / "profile")}
 
 

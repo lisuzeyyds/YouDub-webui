@@ -5,7 +5,8 @@ means scripting the web page. The browser itself is owned by a small Node
 script (``tools/bili-publish/publish.js``); this module owns the decisions and
 the failure semantics:
 
-* which asset to send (final video + a frame lifted from it as the cover),
+* which asset to send (final video + a cover: the original thumbnail when it has
+  no English or can be localised, otherwise a frame lifted from the video),
 * which copy to use (the title/description/tags the translate stage wrote),
 * which partition and collection to pick, matched against the page's own
   option list rather than trusted verbatim,
@@ -26,6 +27,7 @@ from typing import Any
 
 from .. import config
 from ..errors import DeterministicStageError
+from . import cover
 from .ffmpeg import _run_ffmpeg
 
 log = logging.getLogger(__name__)
@@ -54,6 +56,7 @@ class PublishOutcome:
     collection: str = ""
     stage: str = ""
     error: str = ""
+    cover: str = ""
 
     @property
     def url(self) -> str:
@@ -224,6 +227,7 @@ def publish_video(
     zone: str = "",
     collection: str = "",
     settings: dict[str, str] | None = None,
+    video_id: str = "",
     dry_run: bool = False,
 ) -> PublishOutcome:
     """Upload ``video_file`` to Bilibili and return what happened.
@@ -256,7 +260,9 @@ def publish_video(
 
     Path(profile).mkdir(parents=True, exist_ok=True)
 
-    cover_file = build_cover(video_file, session / "tmp" / "bilibili_cover.jpg")
+    cover_file = cover.prepare_cover(session=session, video_id=video_id)
+    if cover_file is None:
+        cover_file = build_cover(video_file, session / "tmp" / "bilibili_cover.jpg")
     if cover_file is None:
         log.warning("publishing without a cover (frame extraction failed)")
 
@@ -316,6 +322,7 @@ def publish_video(
         collection=str(parsed.get("collection") or ""),
         stage=str(parsed.get("stage") or ""),
         error=str(parsed.get("error") or ""),
+        cover=str(cover_file or ""),
     )
     if outcome.ok:
         return outcome
