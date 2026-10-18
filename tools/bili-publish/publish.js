@@ -195,36 +195,83 @@ async function fillForm(page) {
   }
 }
 
+/**
+ * Open the cover dialog.
+ *
+ * The upload page is never without a cover: Bilibili pre-picks a frame out of
+ * the video and says so ("系统默认选中第一张为封面"). An earlier version took the
+ * presence of `.cover-img` as "a cover is already set" and returned early, so
+ * every custom cover - the whole point of the thumbnail work - was dropped on
+ * the floor while the stage still reported success. So: open the dialog and
+ * replace whatever is there.
+ */
+async function openCoverDialog(page) {
+  const hasImageInput = await page.locator('input[accept="image/png, image/jpeg"]').count();
+  if (hasImageInput) {
+    log('cover dialog is already open');
+    return true;
+  }
+
+  // No cover at all (the page still offers the empty slot) - click it.
+  const openedEmpty = await page.evaluate(() => {
+    const el = document.querySelector('.cover-empty')
+      || Array.from(document.querySelectorAll('*')).find(
+        (node) => node.children.length === 0 && (node.innerText || '').trim() === '添加封面'
+      );
+    if (el) {
+      el.click();
+      return true;
+    }
+    return false;
+  });
+  if (openedEmpty) return true;
+
+  // Otherwise the "封面设置" button only exists while the preview is hovered.
+  const centre = await page.evaluate(() => {
+    const el = document.querySelector('.cover-img, .cover-preview-img');
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    return [rect.x + rect.width / 2, rect.y + rect.height / 2];
+  });
+  if (!centre) return false;
+  await page.mouse.move(centre[0], centre[1]);
+  await sleep(1200);
+
+  const clicked = await page.evaluate(() => {
+    const leaves = Array.from(document.querySelectorAll('*')).filter(
+      (el) => el.children.length === 0
+        && (el.innerText || '').trim() === '封面设置'
+        && el.getBoundingClientRect().width > 0
+    );
+    if (!leaves.length) return false;
+    leaves[0].click();
+    return true;
+  });
+  if (!clicked) return false;
+  await sleep(2500);
+  return true;
+}
+
 async function setCover(page) {
   if (!cover || !fs.existsSync(cover)) {
     log('no cover file; leaving the cover empty');
     return;
   }
   stage = 'cover';
-  const already = await page.evaluate(() => !!document.querySelector('.cover-img, .cover-preview-img'));
-  if (already) {
-    log('cover already present; skipping');
-    return;
-  }
-  const opened = await page.evaluate(() => {
-    const el = document.querySelector('.cover-empty')
-      || Array.from(document.querySelectorAll('*')).find(
-        (node) => node.children.length === 0 && (node.innerText || '').trim() === '添加封面'
-      );
-    if (el) { el.click(); return true; }
-    return false;
-  });
+  const opened = await openCoverDialog(page);
   if (!opened) fail('cover', 'cover entry not found');
-  await sleep(3500);
+  await sleep(1500);
 
   const imageInput = page.locator('input[accept="image/png, image/jpeg"]').first();
   await imageInput.waitFor({ state: 'attached', timeout: 30000 });
   await imageInput.setInputFiles(cover);
   await sleep(4000);
+  await shot(page, 'cover_loaded');
 
   const confirmed = await clickExact(page, '完成');
   if (!confirmed) log('cover confirm button not found; the dialog may already be closed');
-  await sleep(2000);
+  await sleep(2500);
   log('cover set');
 }
 
