@@ -136,6 +136,15 @@ def init_db() -> None:
               window_started_at TEXT NOT NULL,
               attempt_count INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS channels (
+              channel_id TEXT PRIMARY KEY,
+              title TEXT NOT NULL DEFAULT '',
+              handle TEXT NOT NULL DEFAULT '',
+              last_seen TEXT NOT NULL DEFAULT '',
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL
+            );
             """
         )
         defaults = openai_defaults()
@@ -894,3 +903,94 @@ def log_path(task_id: str) -> Path:
     if Path(DB_PATH).absolute() != Path(config.DB_PATH).absolute():
         return Path(DB_PATH).absolute().parent / "logs" / f"{task_id}.log"
     return LOG_DIR / f"{task_id}.log"
+
+
+# --- watched YouTube channels -------------------------------------------------
+# One row per channel the watcher polls. ``last_seen`` is the publish time of the
+# newest upload already looked at, so a poll only ever picks up what came after
+# it - and a channel added today starts at "now" instead of replaying its whole
+# back catalogue.
+
+
+def _channel_row(row: sqlite3.Row) -> dict:
+    return {
+        "channel_id": row["channel_id"],
+        "title": row["title"],
+        "handle": row["handle"],
+        "last_seen": row["last_seen"],
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+    }
+
+
+def list_channels() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT channel_id, title, handle, last_seen, enabled, created_at "
+            "FROM channels ORDER BY created_at, channel_id"
+        ).fetchall()
+    return [_channel_row(row) for row in rows]
+
+
+def get_channel(channel_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT channel_id, title, handle, last_seen, enabled, created_at "
+            "FROM channels WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+    return _channel_row(row) if row else None
+
+
+def upsert_channel(
+    channel_id: str,
+    *,
+    title: str = "",
+    handle: str = "",
+    last_seen: str = "",
+) -> None:
+    """Add a channel, or refresh the name of one already watched.
+
+    An empty argument never overwrites a stored value: re-adding a channel must
+    not wipe the cursor and replay its history.
+    """
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO channels (channel_id, title, handle, last_seen, enabled, created_at)
+            VALUES (?, ?, ?, ?, 1, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+              title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE channels.title END,
+              handle = CASE WHEN excluded.handle <> '' THEN excluded.handle ELSE channels.handle END,
+              last_seen = CASE
+                WHEN excluded.last_seen <> '' THEN excluded.last_seen
+                ELSE channels.last_seen
+              END,
+              enabled = 1
+            """,
+            (channel_id, title, handle, last_seen, now_iso()),
+        )
+
+
+def update_channel_seen(channel_id: str, last_seen: str) -> None:
+    if not last_seen:
+        return
+    with connect() as conn:
+        conn.execute(
+            "UPDATE channels SET last_seen = ? WHERE channel_id = ?",
+            (last_seen, channel_id),
+        )
+
+
+def set_channel_enabled(channel_id: str, enabled: bool) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE channels SET enabled = ? WHERE channel_id = ?",
+            (1 if enabled else 0, channel_id),
+        )
+
+
+def delete_channel(channel_id: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+    return cursor.rowcount > 0

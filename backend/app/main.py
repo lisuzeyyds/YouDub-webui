@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, SecretStr
 
-from . import ad_cut, auth, backend_lock, database, runtime_security, worker, worker_selfheal
+from . import ad_cut, auth, backend_lock, channels, database, runtime_security, worker, worker_selfheal
 from .adapters.bilibili import load_publish_result
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
@@ -80,6 +80,14 @@ class ContinueTaskRequest(BaseModel):
 
 class YouTubeCookieUpdate(BaseModel):
     content: str
+
+
+class ChannelCreate(BaseModel):
+    url: str
+
+
+class ChannelUpdate(BaseModel):
+    enabled: bool | None = None
 
 
 class OpenAISettingsUpdate(BaseModel):
@@ -156,16 +164,25 @@ async def lifespan(app: FastAPI):
         # A previous worker may have exited because it could no longer spawn
         # ffmpeg; a fresh process can, so pick that task back up automatically.
         self_healed_task = worker_selfheal.take_pending_resume()
+        owns_lock = True
     else:
         logger.warning(
             "Another backend process owns the runtime lock; "
             "skipping stale-task cleanup (duplicate uvicorn)."
         )
         self_healed_task = None
+        owns_lock = False
     worker.start(run_task)
     if self_healed_task:
         worker.enqueue(self_healed_task)
-    yield
+    # One watcher per machine: a duplicate uvicorn would otherwise queue every
+    # new upload twice (the task table catches it, but the feed is fetched twice).
+    if owns_lock:
+        channels.start()
+    try:
+        yield
+    finally:
+        channels.stop()
 
 
 app = FastAPI(
@@ -821,3 +838,58 @@ def save_bilibili_settings(payload: BilibiliSettingsUpdate) -> dict:
     # from the settings form cannot wipe the tool paths.
     database.save_bilibili_settings(payload.model_dump(exclude_unset=True))
     return get_bilibili_settings()
+
+
+@app.get("/api/channels")
+def list_channels() -> dict:
+    return {"channels": database.list_channels(), "status": channels.status()}
+
+
+@app.post("/api/channels", status_code=201)
+def add_channel(payload: ChannelCreate) -> dict:
+    """Start watching a channel. Nothing is backfilled: the cursor starts at the
+    newest upload, so only videos published from now on are queued."""
+    proxy = channels.default_proxy()
+    try:
+        info = channels.resolve_channel(payload.url, proxy)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - network failure while resolving
+        raise HTTPException(status_code=502, detail=f"could not reach YouTube: {exc}") from exc
+
+    last_seen = ""
+    try:
+        entries = channels.fetch_entries(info["channel_id"], proxy)
+        if entries:
+            last_seen = entries[0]["published"]
+    except Exception:  # noqa: BLE001 - the channel is still worth watching
+        pass
+    database.upsert_channel(
+        info["channel_id"],
+        title=info["title"],
+        handle=info["handle"],
+        last_seen=last_seen,
+    )
+    return {"channel": database.get_channel(info["channel_id"]), "status": channels.status()}
+
+
+@app.post("/api/channels/check")
+def check_channels() -> dict:
+    """Poll every watched channel once - the settings button and a manual kick."""
+    return channels.poll_once()
+
+
+@app.patch("/api/channels/{channel_id}")
+def update_channel(channel_id: str, payload: ChannelUpdate) -> dict:
+    if database.get_channel(channel_id) is None:
+        raise HTTPException(status_code=404, detail="Channel is not watched.")
+    if payload.enabled is not None:
+        database.set_channel_enabled(channel_id, payload.enabled)
+    return {"channel": database.get_channel(channel_id)}
+
+
+@app.delete("/api/channels/{channel_id}", status_code=204)
+def remove_channel(channel_id: str) -> Response:
+    if not database.delete_channel(channel_id):
+        raise HTTPException(status_code=404, detail="Channel is not watched.")
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
