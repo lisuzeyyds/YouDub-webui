@@ -443,6 +443,59 @@ export function saveBilibiliSettings(settings: Partial<BilibiliSettings>) {
   })
 }
 
+export type WatchedChannel = {
+  channel_id: string
+  title: string
+  handle: string
+  last_seen: string
+  enabled: boolean
+  created_at: string
+}
+
+export type ChannelWatchStatus = {
+  running: boolean
+  interval_minutes: number
+  last_poll: string
+  last_error: string
+}
+
+export type ChannelsResponse = {
+  channels: WatchedChannel[]
+  status: ChannelWatchStatus
+}
+
+export type ChannelCheckResult = {
+  channels: number
+  queued: number
+  errors: string[]
+}
+
+export function getChannels() {
+  return request<ChannelsResponse>("/api/channels")
+}
+
+export function addChannel(url: string) {
+  return request<{ channel: WatchedChannel; status: ChannelWatchStatus }>("/api/channels", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  })
+}
+
+export function removeChannel(channelId: string) {
+  return request<void>(`/api/channels/${encodeURIComponent(channelId)}`, { method: "DELETE" })
+}
+
+export function setChannelEnabled(channelId: string, enabled: boolean) {
+  return request<{ channel: WatchedChannel }>(`/api/channels/${encodeURIComponent(channelId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled }),
+  })
+}
+
+export function checkChannels() {
+  return request<ChannelCheckResult>("/api/channels/check", { method: "POST" })
+}
+
 export function finalVideoUrl(taskId: string) {
   return `/api/tasks/${taskId}/artifact/final-video`
 }

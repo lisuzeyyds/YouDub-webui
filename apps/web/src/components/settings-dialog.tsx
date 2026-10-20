@@ -16,6 +16,7 @@ import {
   saveYtdlpSettings,
 } from "@/lib/api"
 import { LANGUAGE_OPTIONS, useI18n } from "@/lib/i18n"
+import { ChannelWatchCard } from "@/components/channel-watch-card"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -499,6 +500,7 @@ export function SettingsDialog() {
                   className="min-h-16 text-xs"
                 />
               </div>
+              <ChannelWatchCard />
               {saveResults.length > 0 ? (
                 <div
                   data-testid="settings-save-results"
