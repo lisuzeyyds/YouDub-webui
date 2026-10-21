@@ -1191,6 +1191,75 @@ def test_translate_batch_falls_back_to_a_copy_request(monkeypatch):
     assert seen["has_link"] is True
 
 
+def test_translate_batch_asks_for_the_copy_when_the_bulk_request_dies(monkeypatch):
+    """A dead whole-transcript request must not cost the upload its copy.
+
+    The bulk request can fail outright - the relay dropped the stream on a
+    495-line transcript and every line then went through the per-sentence path.
+    The copy was only requested inside the ``bulk is not None`` branch, so that
+    upload went out with no description, no tags and no partition.
+    """
+    monkeypatch.setattr(openai_translate, "translate_bulk", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        openai_translate,
+        "_call_json",
+        lambda client, model, system, user: {"dst": f"zh:{user}", "audio_mode": "tts"},
+    )
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    seen: dict[str, object] = {}
+
+    def fake_copy(texts, system, *, client, model, **kwargs):
+        seen["texts"] = list(texts)
+        seen["zones"] = kwargs.get("zone_options")
+        return openai_translate.BulkResult(
+            title="诅咒隧道",
+            description="简介",
+            tags=["探险"],
+            zone="纪录片",
+            collection="户外活动",
+        )
+
+    monkeypatch.setattr(openai_translate, "_copy_request", fake_copy)
+
+    meta_out: dict[str, object] = {}
+    out = openai_translate.translate_batch(
+        ["s0", "s1", "s2"], YT_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=2,
+        meta_out=meta_out, zone_options=["纪录片", "生活"],
+    )
+    assert [item.dst for item in out] == ["zh:s0", "zh:s1", "zh:s2"]
+    assert meta_out["title"] == "诅咒隧道"
+    assert meta_out["tags"] == ["探险"]
+    assert meta_out["zone"] == "纪录片"
+    assert seen["texts"] == ["s0", "s1", "s2"]
+    assert seen["zones"] == ["纪录片", "生活"]
+
+
+def test_translate_batch_survives_a_failing_copy_request(monkeypatch):
+    """The copy is enrichment; a dead relay there must not fail a translation."""
+    monkeypatch.setattr(openai_translate, "translate_bulk", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        openai_translate,
+        "_call_json",
+        lambda client, model, system, user: {"dst": f"zh:{user}", "audio_mode": "tts"},
+    )
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("relay is down")
+
+    monkeypatch.setattr(openai_translate, "_copy_request", boom)
+
+    meta_out: dict[str, object] = {}
+    out = openai_translate.translate_batch(
+        ["s0"], YT_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", meta_out=meta_out,
+    )
+    assert [item.dst for item in out] == ["zh:s0"]
+    assert meta_out == {}
+
+
 def test_translate_batch_skips_the_copy_fallback_when_sections_arrived(monkeypatch):
     """No extra request when the whole-transcript reply already carried the copy."""
 

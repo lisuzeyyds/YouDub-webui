@@ -1407,6 +1407,39 @@ def translate_batch(
         for index, item in zip(pending, filled):
             results[index] = item
 
+    if meta_out is not None and not (meta_out.get("title") or meta_out.get("description")):
+        # The whole-transcript request can fail outright - a relay that drops a
+        # long stream does - and then every line is translated on its own and no
+        # upload copy is ever asked for. That is how one upload went out with an
+        # empty description, no tags and no partition. The copy describes the
+        # video, not the translations, so ask for it in one small request of its
+        # own; a failure here must not fail a finished translation.
+        try:
+            copy = _copy_request(
+                _condense(texts),
+                _bulk_copy_system(
+                    meta,
+                    source_url,
+                    zone_options=zone_options,
+                    collection_options=collection_options,
+                ),
+                client=client,
+                model=model,
+                zone_options=zone_options,
+                collection_options=collection_options,
+            )
+        except TranslationApiError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - copy is best-effort
+            log.warning("copy fallback failed, shipping without it: %s", exc)
+            copy = None
+        if copy is not None:
+            meta_out["title"] = copy.title
+            meta_out["description"] = copy.description
+            meta_out["tags"] = list(copy.tags)
+            meta_out["zone"] = copy.zone
+            meta_out["collection"] = copy.collection
+
     return [item for item in results if item is not None]
 
 
