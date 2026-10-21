@@ -45,6 +45,11 @@ const {
   dryRun = false,
   shotDir = '',
   uploadTimeoutMs = 60 * 60 * 1000,
+  // Submitting is not instant: a big file is still being handed to the server
+  // when the button is clicked, and an 886 MB video can take minutes. Two
+  // minutes was far too short and reported a failed upload for a submission
+  // that was still in flight.
+  submitTimeoutMs = 15 * 60 * 1000,
   settleMs = 6000,
 } = payload;
 
@@ -195,6 +200,19 @@ async function fillForm(page) {
   }
 }
 
+/** Wait until the cover block has rendered (it appears once the video is read). */
+async function waitForCoverEntry(page, timeoutMs = 90000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ready = await page.evaluate(
+      () => !!document.querySelector('.cover-empty, .cover-img, .cover-preview-img')
+    );
+    if (ready) return true;
+    await sleep(2000);
+  }
+  return false;
+}
+
 /**
  * Open the cover dialog.
  *
@@ -212,6 +230,11 @@ async function openCoverDialog(page) {
     return true;
   }
 
+  if (!(await waitForCoverEntry(page))) {
+    log('cover block never rendered');
+    return false;
+  }
+
   // No cover at all (the page still offers the empty slot) - click it.
   const openedEmpty = await page.evaluate(() => {
     const el = document.querySelector('.cover-empty')
@@ -226,7 +249,20 @@ async function openCoverDialog(page) {
   });
   if (openedEmpty) return true;
 
-  // Otherwise the "封面设置" button only exists while the preview is hovered.
+  // Filling the form leaves the page scrolled to the tags at the bottom, so the
+  // cover preview sits above the viewport. Hovering it would aim the cursor at a
+  // negative y - the mask with "封面设置" never appears and the stage fails with
+  // "cover entry not found" while the cover is visibly there on the page.
+  const scrolled = await page.evaluate(() => {
+    const el = document.querySelector('.cover-img, .cover-preview-img');
+    if (!el) return false;
+    el.scrollIntoView({ block: 'center' });
+    return true;
+  });
+  if (!scrolled) return false;
+  await sleep(900);
+
+  // Re-measure after the scroll: the first rect may predate it.
   const centre = await page.evaluate(() => {
     const el = document.querySelector('.cover-img, .cover-preview-img');
     if (!el) return null;
@@ -260,7 +296,10 @@ async function setCover(page) {
   }
   stage = 'cover';
   const opened = await openCoverDialog(page);
-  if (!opened) fail('cover', 'cover entry not found');
+  if (!opened) {
+    await shot(page, 'cover_failed');
+    fail('cover', 'cover entry not found');
+  }
   await sleep(1500);
 
   const imageInput = page.locator('input[accept="image/png, image/jpeg"]').first();
@@ -287,9 +326,30 @@ async function setZone(page, wanted) {
     if (el) el.click();
   });
   await sleep(1800);
-  let outcome = await clickOption(page, wanted);
+  // The dropdown is a virtual list of `.drop-list-v2-item` rows whose names live
+  // in `.item-cont-main`; the generic leaf-text search below finds them only by
+  // luck, so try the real structure first.
+  const picked = await page.evaluate((want) => {
+    const rows = Array.from(document.querySelectorAll('.drop-list-v2-item'));
+    const nameOf = (el) => (el.querySelector('.item-cont-main') || el).innerText.trim();
+    const row = rows.find((el) => nameOf(el) === want);
+    if (!row) return false;
+    row.scrollIntoView({ block: 'center' });
+    (row.querySelector('.item-cont-main') || row).click();
+    return true;
+  }, wanted);
+  let outcome = picked ? 'clicked' : await clickOption(page, wanted);
   if (outcome === 'not-found') {
-    log(`zone "${wanted}" not in the dropdown; keeping "${before}"`);
+    // Bilibili renames and splits its partitions from time to time - "纪录片"
+    // and "科技" no longer exist - so say what is on offer instead of silently
+    // keeping whatever the page picked.
+    const offered = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('.drop-list-v2-item .item-cont-main'))
+        .map((el) => (el.innerText || '').trim())
+        .filter(Boolean)
+        .join(', ')
+    );
+    log(`zone "${wanted}" not in the dropdown; keeping "${before}". Offered: ${offered}`);
     await page.keyboard.press('Escape').catch(() => {});
     await sleep(600);
     return before;
@@ -389,7 +449,8 @@ async function submit(page) {
   if (!clicked) fail('submit', '"立即投稿" button not found');
   log('submit clicked');
 
-  const deadline = Date.now() + 120000;
+  const deadline = Date.now() + submitTimeoutMs;
+  let lastSeen = '';
   while (Date.now() < deadline) {
     await sleep(3000);
     const text = await bodyText(page);
@@ -397,12 +458,22 @@ async function submit(page) {
     if (/请添加创作声明|请选择创作声明/.test(text)) {
       fail('submit', 'Bilibili rejected the submission because of the creation declaration');
     }
-    if (/请填写|请输入标题|请添加/.test(text)) {
+    if (/请填写标题|请输入标题|请填写分区|请选择分区|请添加标签|请上传视频/.test(text)) {
       const hint = (text.match(/请[^ ]{2,20}/) || [''])[0];
       fail('submit', `Bilibili rejected the submission: ${hint}`);
     }
+    // The page shows how far it has got; keep it in the log so a timeout can
+    // be diagnosed instead of guessed at.
+    const progress = (text.match(/(上传中|转码中|提交中|处理中)[^ ]{0,12}/) || [''])[0];
+    if (progress && progress !== lastSeen) {
+      lastSeen = progress;
+      log(`submit progress: ${progress}`);
+    }
+    if (!/立即投稿|发布视频/.test(text) && /BV[0-9A-Za-z]{10}/.test(text)) return;
   }
-  fail('submit', 'timed out waiting for the submission result');
+  const tail = await bodyText(page);
+  if (/BV[0-9A-Za-z]{10}/.test(tail) || /稿件投递成功|投稿成功/.test(tail)) return;
+  fail('submit', `timed out waiting for the submission result after ${Math.round(submitTimeoutMs / 60000)} min`);
 }
 
 function bvidFromText(text) {
