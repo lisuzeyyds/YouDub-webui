@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import types
 
 import httpx
@@ -801,17 +802,56 @@ def test_translate_bulk_chunks_an_over_budget_transcript(monkeypatch):
     assert out.lines == {1: "zh:" + "a" * 20, 2: "zh:" + "b" * 20, 3: "zh:" + "c" * 20}
 
 
+def test_translate_bulk_requests_chunks_in_parallel(monkeypatch):
+    """Chunks are independent, so they must overlap instead of queueing.
+
+    Each chunk costs the same wall clock as the whole stage used to; sending
+    nine of them one after another is nine minutes for no reason.
+    """
+    _enable_bulk(monkeypatch)
+    monkeypatch.setattr(openai_translate, "BULK_MAX_CHARS", 40)
+    monkeypatch.setattr(openai_translate, "BULK_CHUNK_CONCURRENCY", 3)
+    lock = __import__("threading").Lock()
+    state = {"live": 0, "peak": 0}
+
+    def fake_bulk(client, model, system, payload):
+        with lock:
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+        time.sleep(0.05)
+        with lock:
+            state["live"] -= 1
+        count = len(payload.splitlines())
+        return "\n".join(f"{i}\tzh{i}" for i in range(1, count + 1))
+
+    monkeypatch.setattr(openai_translate, "_call_bulk", fake_bulk)
+    texts = [chr(ord("a") + index) * 20 for index in range(6)]
+    out = openai_translate.translate_bulk(
+        texts, YT_SOURCE, {}, PreprocessResponse(), client=object(), model="m",
+    )
+    assert state["peak"] > 1, "chunks were served one at a time"
+    assert out is not None
+    # Every chunk numbers its own lines from 1, so the merge has to re-base them
+    # onto the transcript: one sentence per chunk here means six keys, not one.
+    assert set(out.lines) == set(range(1, 7))
+    assert set(out.lines.values()) == {"zh1"}
+
+
 def test_translate_bulk_merges_chunk_metadata_and_ad_lines(monkeypatch):
     """Chunked replies keep the video-level copy and re-index their ad lines."""
     _enable_bulk(monkeypatch)
     monkeypatch.setattr(openai_translate, "BULK_MAX_CHARS", 40)
     calls = {"n": 0}
+    lock = __import__("threading").Lock()
 
     def fake_bulk(client, model, system, payload):
-        calls["n"] += 1
+        with lock:
+            calls["n"] += 1
         count = len(payload.splitlines())
         body = "\n".join(f"{i}\tzh{i}" for i in range(1, count + 1))
-        if calls["n"] == 1:
+        # Keyed on the content, not on the call order: chunks are requested in
+        # parallel, so "the first call" is not "the first chunk".
+        if (("a" * 20) in payload):
             return (
                 "#=== 标题 ===\n我的标题\n#=== 广告行号 ===\n1\n" + body
             )

@@ -51,11 +51,19 @@ DEFAULT_CONCURRENCY = 50
 #
 # The request is streamed (see ``_call_bulk``), which is what lets a payload this
 # large complete at all: the relay's gateway cuts any response whose body has not
-# started after ~100s, and a full transcript takes minutes to generate. A
-# payload past the cap is split into consecutive chunks rather than falling back
-# to one request per sentence, because 1068 sentences at ~27s each (concurrency
-# 2) is an hour while the same text in three streamed chunks is a few minutes.
-BULK_MAX_CHARS = 40000
+# started after ~100s, and a full transcript takes minutes to generate.
+#
+# The cap is set by how fast the model writes, not by the model's context: this
+# relay also ends any *streamed* reply at ~300s, and gpt-5.6-sol writes about
+# 8 chars/s. A 3146-char chunk therefore died at 302s with one character of
+# reply, retried three times, and handed 384 sentences to the per-sentence path
+# at concurrency 2 - a measured 8 hours for one video. 1500 chars finishes in
+# 138s; 1600 leaves room for a slower minute without going near the cut.
+BULK_MAX_CHARS = int(os.environ.get("YOUDUB_BULK_MAX_CHARS") or 1600)
+# Chunks are independent requests and are sent in parallel: at ~140s each, a
+# 13k-char transcript is 9 chunks - nine minutes one at a time, three in
+# parallel. Kept small because the same relay throttles concurrent streams.
+BULK_CHUNK_CONCURRENCY = int(os.environ.get("YOUDUB_BULK_CHUNK_CONCURRENCY") or 3)
 BULK_ATTEMPTS = 3
 # Share of a chunk a mid-stream drop must have delivered before the partial
 # reply is kept instead of retried; below it the chunk is cheap enough to redo.
@@ -72,7 +80,10 @@ BULK_MAX_TOKENS = 16000
 # coming. One real request sat like that for 27 minutes before the relay finally
 # put an error object in the stream. Past this deadline the partial reply is kept
 # and the request is retried, which costs minutes instead of half an hour.
-BULK_REQUEST_TIMEOUT = 600.0
+#
+# This relay now also cuts any streamed reply at ~300s, so waiting the earlier
+# 600s only delays the retry: a chunk sized for 140s is over by 360s.
+BULK_REQUEST_TIMEOUT = 360.0
 # A long reply can still end early (stream cut, gateway hiccup). Asking again for
 # just the uncovered tail is one more request; handing the same leftovers to the
 # per-sentence path is 400+ requests and hours.
@@ -1067,16 +1078,15 @@ def translate_bulk(
     chunks = _chunk_by_payload(texts, BULK_MAX_CHARS)
     if len(chunks) > 1:
         log.info(
-            "bulk translate: %d sentences split into %d chunk(s) of <=%d chars",
+            "bulk translate: %d sentences split into %d chunk(s) of <=%d chars, %d at a time",
             len(texts),
             len(chunks),
             BULK_MAX_CHARS,
+            min(BULK_CHUNK_CONCURRENCY, len(chunks)),
         )
-    merged = BulkResult()
-    offset = 0
-    served = False
-    for chunk in chunks:
-        result = _bulk_request_chunk(
+
+    def serve(chunk: list[str]) -> BulkResult | None:
+        return _bulk_request_chunk(
             chunk,
             system,
             client=client,
@@ -1084,6 +1094,21 @@ def translate_bulk(
             zone_options=zone_options,
             collection_options=collection_options,
         )
+
+    # Chunks are consecutive, independent and cost the same wall clock each, so
+    # sending them one by one only adds up: nine 140s chunks are nine minutes
+    # serially and three in parallel. Results are consumed in order, so the line
+    # numbers still map back to the transcript.
+    if len(chunks) == 1:
+        results: list[BulkResult | None] = [serve(chunks[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(BULK_CHUNK_CONCURRENCY, len(chunks))) as pool:
+            results = list(pool.map(serve, chunks))
+
+    merged = BulkResult()
+    offset = 0
+    served = False
+    for chunk, result in zip(chunks, results):
         if result is not None:
             served = True
             for number, text in result.lines.items():
