@@ -60,10 +60,14 @@ DEFAULT_CONCURRENCY = 50
 # at concurrency 2 - a measured 8 hours for one video. 1500 chars finishes in
 # 138s; 1600 leaves room for a slower minute without going near the cut.
 BULK_MAX_CHARS = int(os.environ.get("YOUDUB_BULK_MAX_CHARS") or 1600)
-# Chunks are independent requests and are sent in parallel: at ~140s each, a
-# 13k-char transcript is 9 chunks - nine minutes one at a time, three in
-# parallel. Kept small because the same relay throttles concurrent streams.
-BULK_CHUNK_CONCURRENCY = int(os.environ.get("YOUDUB_BULK_CHUNK_CONCURRENCY") or 3)
+# Two chunks at a time. Not more: measured on this relay, one stream writes about
+# 28 chars/s but three streams together only reach 8-22, so the account - not the
+# request - is the limit. A second stream hides the per-request latency; a third
+# only makes each one slower and pushes them towards the 300s cut.
+BULK_CHUNK_CONCURRENCY = int(os.environ.get("YOUDUB_BULK_CHUNK_CONCURRENCY") or 2)
+# A chunk that comes back empty is split in half and retried, at most this
+# many times, before its lines fall through to the per-sentence path.
+BULK_SPLIT_DEPTH = 2
 BULK_ATTEMPTS = 3
 # Share of a chunk a mid-stream drop must have delivered before the partial
 # reply is kept instead of retried; below it the chunk is cheap enough to redo.
@@ -83,7 +87,7 @@ BULK_MAX_TOKENS = 16000
 #
 # This relay now also cuts any streamed reply at ~300s, so waiting the earlier
 # 600s only delays the retry: a chunk sized for 140s is over by 360s.
-BULK_REQUEST_TIMEOUT = 360.0
+BULK_REQUEST_TIMEOUT = 240.0
 # A long reply can still end early (stream cut, gateway hiccup). Asking again for
 # just the uncovered tail is one more request; handing the same leftovers to the
 # per-sentence path is 400+ requests and hours.
@@ -895,6 +899,7 @@ def _bulk_request(
     model: str,
     zone_options: Sequence[str] = (),
     collection_options: Sequence[str] = (),
+    attempts: int = BULK_ATTEMPTS,
 ) -> BulkResult | None:
     """Run one streamed whole-transcript request; ``None`` when it is unusable."""
     payload = _bulk_payload(texts)
@@ -903,7 +908,8 @@ def _bulk_request(
         "collection_options": collection_options,
     }
     last_error: Exception | None = None
-    for attempt in range(BULK_ATTEMPTS):
+    budget = max(1, attempts)
+    for attempt in range(budget):
         try:
             raw = _call_bulk(client, model, system, payload)
         except TranslationApiError:
@@ -914,7 +920,7 @@ def _bulk_request(
             log.warning(
                 "bulk translate stream failed (attempt %d/%d) after %d char(s): %s",
                 attempt + 1,
-                BULK_ATTEMPTS,
+                budget,
                 len(partial),
                 exc,
             )
@@ -931,7 +937,7 @@ def _bulk_request(
                         len(texts),
                     )
                     return parsed
-            if attempt < BULK_ATTEMPTS - 1:
+            if attempt < budget - 1:
                 time.sleep(_backoff(attempt))
             continue
         parsed = _parse_bulk(raw, len(texts), **parse_kwargs)
@@ -947,10 +953,10 @@ def _bulk_request(
         log.warning(
             "bulk translate reply had no usable lines (attempt %d/%d); raw[:200]=%r",
             attempt + 1,
-            BULK_ATTEMPTS,
+            budget,
             raw[:200],
         )
-    log.warning("bulk translate gave up after %d attempts: %s", BULK_ATTEMPTS, last_error)
+    log.warning("bulk translate gave up after %d attempt(s): %s", budget, last_error)
     return None
 
 
@@ -988,6 +994,10 @@ def _bulk_request_chunk(
             model=model,
             zone_options=zone_options,
             collection_options=collection_options,
+            # Two attempts, not more: one retry rides out a dropped connection,
+            # and anything that fails twice is split in half by the caller - a
+            # size that already failed twice will keep failing.
+            attempts=2,
         )
         if reply is None:
             break
@@ -1085,8 +1095,8 @@ def translate_bulk(
             min(BULK_CHUNK_CONCURRENCY, len(chunks)),
         )
 
-    def serve(chunk: list[str]) -> BulkResult | None:
-        return _bulk_request_chunk(
+    def serve(chunk: list[str], depth: int = 0) -> BulkResult | None:
+        result = _bulk_request_chunk(
             chunk,
             system,
             client=client,
@@ -1094,11 +1104,47 @@ def translate_bulk(
             zone_options=zone_options,
             collection_options=collection_options,
         )
+        # A chunk that came back with nothing was most likely cut off at the
+        # relay's stream limit, which says the chunk is too big for how fast the
+        # model is writing right now - that speed varies several fold over the
+        # day, so no fixed size stays right. Retrying the same size fails the
+        # same way; halving it makes progress instead.
+        if result is None and depth < BULK_SPLIT_DEPTH and len(chunk) > 2:
+            middle = len(chunk) // 2
+            log.warning(
+                "bulk chunk of %d line(s) failed; splitting into %d + %d",
+                len(chunk),
+                middle,
+                len(chunk) - middle,
+            )
+            left = serve(chunk[:middle], depth + 1)
+            right = serve(chunk[middle:], depth + 1)
+            if left is None and right is None:
+                return None
+            result = BulkResult()
+            for half, base in ((left, 0), (right, middle)):
+                if half is None:
+                    continue
+                for number, text in half.lines.items():
+                    result.lines[base + number] = text
+                for number in half.ad_lines:
+                    result.ad_lines.add(base + number)
+                if not result.title:
+                    result.title = half.title
+                if not result.description:
+                    result.description = half.description
+                if not result.tags:
+                    result.tags = list(half.tags)
+                if not result.zone:
+                    result.zone = half.zone
+                if not result.collection:
+                    result.collection = half.collection
+        return result
 
-    # Chunks are consecutive, independent and cost the same wall clock each, so
-    # sending them one by one only adds up: nine 140s chunks are nine minutes
-    # serially and three in parallel. Results are consumed in order, so the line
-    # numbers still map back to the transcript.
+    # Chunks are consecutive and independent; sending a couple at once hides the
+    # per-request latency without asking the relay for throughput it does not
+    # give (it throttles per account, so more streams only make each one slower).
+    # Results are consumed in order, so line numbers still map to the transcript.
     if len(chunks) == 1:
         results: list[BulkResult | None] = [serve(chunks[0])]
     else:

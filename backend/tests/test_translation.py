@@ -1089,7 +1089,7 @@ def test_bulk_request_keeps_a_partial_stream_and_asks_for_the_tail(monkeypatch):
     assert payloads[1].splitlines() == ["1\tS.", "2\tS."]
 
 
-def test_bulk_request_chunk_stops_when_a_round_adds_nothing(monkeypatch):
+def test_bulk_request_stops_when_a_reply_answers_nothing(monkeypatch):
     """A reply that answers nothing must not be retried forever."""
     _enable_bulk(monkeypatch)
     monkeypatch.setattr(openai_translate.time, "sleep", lambda *_: None)
@@ -1100,12 +1100,43 @@ def test_bulk_request_chunk_stops_when_a_round_adds_nothing(monkeypatch):
         return "no numbered lines here"
 
     monkeypatch.setattr(openai_translate, "_call_bulk", fake_bulk)
-    out = openai_translate.translate_bulk(
-        ["S."] * 10, YT_SOURCE, {}, PreprocessResponse(), client=object(), model="m",
-    )
-    assert out is None
-    # BULK_ATTEMPTS for the one round that made no progress, then stop.
+    assert openai_translate._bulk_request(
+        ["S."] * 10, "sys", client=object(), model="m"
+    ) is None
     assert calls["n"] == openai_translate.BULK_ATTEMPTS
+
+
+def test_translate_bulk_splits_a_chunk_the_relay_cut(monkeypatch):
+    """A chunk too big for the stream limit is halved instead of re-sent as is.
+
+    The relay cuts long replies at ~300s and the model's write speed varies
+    several fold over the day, so no fixed chunk size stays right. Reacting to
+    the cut by halving makes progress where retrying the same size cannot.
+    """
+    _enable_bulk(monkeypatch)
+    monkeypatch.setattr(openai_translate, "BULK_MAX_CHARS", 16)
+    monkeypatch.setattr(openai_translate, "BULK_CHUNK_CONCURRENCY", 1)
+    monkeypatch.setattr(openai_translate.time, "sleep", lambda *_: None)
+    sizes: list[int] = []
+
+    def fake_bulk(client, model, system, payload):
+        count = len(payload.splitlines())
+        sizes.append(count)
+        if count > 2:
+            raise openai_translate.TransientApiError("the stream was cut")
+        return "\n".join(f"{index}\tzh{index}" for index in range(1, count + 1))
+
+    monkeypatch.setattr(openai_translate, "_call_bulk", fake_bulk)
+    out = openai_translate.translate_bulk(
+        ["S."] * 8, YT_SOURCE, {}, PreprocessResponse(), client=object(), model="m",
+    )
+    assert out is not None
+    # Both halves of both chunks answered, still numbered against the transcript.
+    assert set(out.lines) == set(range(1, 9))
+    # The first chunk is retried once at the same size, then halved - not sent a
+    # third time at a size the relay has already refused twice.
+    assert sizes[0] == sizes[1] == 3, sizes
+    assert min(sizes) <= 2, sizes
 
 
 def test_bulk_request_retries_a_partial_stream_that_is_too_small(monkeypatch):
@@ -1119,10 +1150,9 @@ def test_bulk_request_retries_a_partial_stream_that_is_too_small(monkeypatch):
         raise openai_translate.PartialReplyError("boom", "1\tzh1")
 
     monkeypatch.setattr(openai_translate, "_call_bulk", fake_bulk)
-    out = openai_translate.translate_bulk(
-        ["S."] * 10, YT_SOURCE, {}, PreprocessResponse(), client=object(), model="m",
-    )
-    assert out is None
+    assert openai_translate._bulk_request(
+        ["S."] * 10, "sys", client=object(), model="m"
+    ) is None
     assert calls["n"] == openai_translate.BULK_ATTEMPTS
 
 
