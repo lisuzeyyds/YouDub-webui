@@ -1185,3 +1185,42 @@ def test_translate_stage_hands_the_configured_partition_candidates_to_the_prompt
 
     assert captured["zone_options"] == ["游戏", "知识"]
     assert captured["collection_options"] == ["mc", "科普"]
+
+
+def test_adapter_logs_land_in_the_task_log(monkeypatch, tmp_path):
+    """A warning from an adapter must be readable in the task log.
+
+    Diagnosing a slow stage always ended in the server console, because only the
+    pipeline's own messages reached the log file. The records that explained the
+    problem - a stream cut, a chunk split, a thumbnail that could not be fetched
+    - lived in a window nobody had open.
+    """
+    configure_db(monkeypatch, tmp_path)
+    task_id = "LOGTEST0001"
+
+    handler = pipeline._TaskLogHandler(task_id)
+    logger = logging.getLogger("backend.app")
+    logger.addHandler(handler)
+    try:
+        logging.getLogger("backend.app.adapters.cover").warning("cover fetch failed: proxy is off")
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+    text = database.log_path(task_id).read_text(encoding="utf-8")
+    assert "[log] WARNING backend.app.adapters.cover: cover fetch failed: proxy is off" in text
+
+
+def test_the_log_handler_is_removed_when_the_run_ends(monkeypatch, tmp_path):
+    """A finished task must not keep a handler attached to the shared logger."""
+    configure_db(monkeypatch, tmp_path)
+    task_id = "LOGTEST0002"
+    database.create_or_get_video_task(f"https://www.youtube.com/watch?v={task_id[:11]}", task_id[:11])
+    for name in STAGES:
+        database.update_stage(task_id, name.name, status="skipped")
+
+    logger = logging.getLogger("backend.app")
+    before = len(logger.handlers)
+    runner = PipelineRunner(task_id)
+    runner.run()
+    assert len(logger.handlers) == before

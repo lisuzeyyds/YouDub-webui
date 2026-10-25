@@ -102,6 +102,33 @@ def _write_log(task_id: str, message: str) -> None:
             handle.write(f"[{timestamp}] {line}\n")
 
 
+class _TaskLogHandler(logging.Handler):
+    """Copy the adapters' own log records into the running task's log file.
+
+    Everything worth knowing about a slow stage was already being logged - a cut
+    stream, a chunk split in half, a thumbnail that could not be fetched - but it
+    went to the server console, which nobody reads while a task is failing. The
+    task log is where a failure is actually investigated, so the records land
+    there too, tagged like every other line.
+    """
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(level=logging.INFO)
+        self.task_id = task_id
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - I/O guard
+        try:
+            message = self.format(record)
+        except Exception:  # noqa: BLE001 - a log call must never break a task
+            self.handleError(record)
+            return
+        try:
+            _write_log(self.task_id, f"[log] {message}")
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
+
+
 def _require(value, name: str):
     if value is None:
         raise RuntimeError(f"Missing pipeline artifact: {name}")
@@ -153,6 +180,9 @@ class PipelineRunner:
             database.update_task(self.task_id, status="running")
             self.log("Task continued")
 
+        handler = _TaskLogHandler(self.task_id)
+        app_logger = logging.getLogger("backend.app")
+        app_logger.addHandler(handler)
         try:
             validate_runtime_device()
             self.log(f"Device plan: {device_plan_summary()}")
@@ -212,6 +242,9 @@ class PipelineRunner:
                 context="task failure",
             )
             self._self_heal_if_ffmpeg_broken(failed_stage, exc)
+        finally:
+            app_logger.removeHandler(handler)
+            handler.close()
 
     def _self_heal_if_ffmpeg_broken(self, failed_stage: str | None, exc: Exception) -> None:
         """Restart the worker when it can no longer start ffmpeg at all.
