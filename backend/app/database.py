@@ -304,12 +304,19 @@ def backfill_titles_from_metadata() -> None:
 
 
 def fail_stale_active_tasks() -> None:
+    """Mark whatever a dead backend left *running* as failed.
+
+    Queued tasks are deliberately excluded: they never started, so nothing about
+    them is stale, and ``worker.start`` re-enqueues every queued task on boot.
+    Sweeping them failed emptied the entire queue on every restart - including
+    the restarts the supervisor performs on its own - and the tasks then sat
+    there forever, because only failed tasks can be resumed by hand.
+    """
     message = "Backend restarted before the task completed."
     completed_at = now_iso()
     with connect() as conn:
         active_tasks = conn.execute(
-            f"SELECT id, current_stage FROM tasks WHERE status IN ({','.join('?' for _ in ACTIVE_STATUSES)})",
-            ACTIVE_STATUSES,
+            "SELECT id, current_stage FROM tasks WHERE status = 'running'"
         ).fetchall()
         for task in active_tasks:
             conn.execute(
