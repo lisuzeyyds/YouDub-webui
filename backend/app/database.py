@@ -45,6 +45,17 @@ def connect() -> sqlite3.Connection:
         raise
 
 
+def _ensure_task_retry_column(conn: sqlite3.Connection) -> None:
+    """Add ``tasks.retry_count`` to a database created before auto-retry.
+
+    CREATE TABLE IF NOT EXISTS leaves an existing table alone, so an install
+    that predates the column would fail every INSERT/UPDATE that names it.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "retry_count" not in columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+
+
 def _migrate_openai_defaults_to_atlascloud(conn: sqlite3.Connection) -> None:
     """Repoint an untouched OpenAI install at Atlas Cloud after an upgrade.
 
@@ -98,7 +109,8 @@ def init_db() -> None:
               completed_at TEXT,
               execution_mode TEXT NOT NULL DEFAULT 'auto',
               output_mode TEXT NOT NULL DEFAULT 'both',
-              auto_publish INTEGER NOT NULL DEFAULT 0
+              auto_publish INTEGER NOT NULL DEFAULT 0,
+              retry_count INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS task_stages (
@@ -154,6 +166,7 @@ def init_db() -> None:
                 (f"openai.{key}", value, now_iso()),
             )
         _migrate_openai_defaults_to_atlascloud(conn)
+        _ensure_task_retry_column(conn)
         for key, value in ytdlp_defaults().items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
@@ -696,10 +709,49 @@ def reset_failed_for_resume(task_id: str) -> None:
             """
             UPDATE tasks
             SET status = 'queued', error_message = NULL, completed_at = NULL,
-                started_at = NULL
+                started_at = NULL, retry_count = 0
             WHERE id = ?
             """,
             (task_id,),
+        )
+
+
+def bump_task_retry(task_id: str) -> int:
+    """Count one automatic retry and return the new total."""
+    with connect() as conn:
+        conn.execute("UPDATE tasks SET retry_count = retry_count + 1 WHERE id = ?", (task_id,))
+        row = conn.execute("SELECT retry_count FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return int(row["retry_count"]) if row else 0
+
+
+def requeue_for_retry(task_id: str, note: str) -> None:
+    """Put a failed task back in the queue without waiting for a human.
+
+    The stage that failed goes back to pending so the run picks it up again;
+    completed stages keep their outputs and are skipped on the next pass.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM task_stages WHERE task_id = ? AND status IN ('failed', 'running')",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                """
+                UPDATE task_stages
+                SET status = 'pending', started_at = NULL, completed_at = NULL,
+                    progress = NULL, last_message = NULL, error_message = NULL
+                WHERE task_id = ? AND name = ?
+                """,
+                (task_id, row["name"]),
+            )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'queued', error_message = ?, completed_at = NULL, started_at = NULL
+            WHERE id = ?
+            """,
+            (note, task_id),
         )
 
 

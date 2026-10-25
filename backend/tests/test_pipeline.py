@@ -13,6 +13,7 @@ from openai import APIError
 from backend.app import database
 from backend.app import pipeline
 from backend.app.adapters.openai_translate import TranslationApiError
+from backend.app.errors import DeterministicStageError
 from backend.app.pipeline import PipelineRunner
 from backend.app.stages import STAGES
 
@@ -1224,3 +1225,120 @@ def test_the_log_handler_is_removed_when_the_run_ends(monkeypatch, tmp_path):
     runner = PipelineRunner(task_id)
     runner.run()
     assert len(logger.handlers) == before
+
+
+def test_a_network_failure_requeues_the_task_instead_of_failing_it(monkeypatch, tmp_path):
+    """A dead proxy must not cost the video.
+
+    Downloads that die because the proxy is off are the one failure that
+    routinely clears by itself, and the retry costs seconds. The task goes back
+    to the queue with its stage pending, and comes back later on its own.
+    """
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=proxyisoff", task_id="proxyisoff")
+    database.update_task(task_id, status="running", current_stage="download")
+    database.update_stage(task_id, "download", status="running")
+    scheduled: dict = {}
+    monkeypatch.setattr(
+        pipeline.worker, "enqueue_later", lambda tid, delay: scheduled.update(id=tid, delay=delay)
+    )
+
+    runner = PipelineRunner(task_id)
+    handled = runner._schedule_auto_retry(
+        "download",
+        RuntimeError("the video download failed: the network could not reach the source"),
+    )
+
+    assert handled is True
+    task = database.get_task(task_id)
+    assert task["status"] == "queued"
+    assert task["retry_count"] == 1
+    assert "retrying automatically in 5 min" in task["error_message"]
+    assert scheduled == {"id": task_id, "delay": 300}
+    stages = {stage["name"]: stage for stage in task["stages"]}
+    assert stages["download"]["status"] == "pending"
+
+
+def test_a_failure_that_will_not_clear_is_left_failed(monkeypatch, tmp_path):
+    """No 1080p version is the video's fault: retrying it only wastes time."""
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=nocookie1", task_id="nocookie1")
+    database.update_task(task_id, status="running", current_stage="download")
+    database.update_stage(task_id, "download", status="running")
+    monkeypatch.setattr(
+        pipeline.worker, "enqueue_later", lambda *a, **k: pytest.fail("should not be retried")
+    )
+
+    runner = PipelineRunner(task_id)
+    assert runner._schedule_auto_retry(
+        "download", DeterministicStageError("YouTube wants a sign-in cookie; update the cookie in settings")
+    ) is False
+    assert runner._schedule_auto_retry(
+        "download", DeterministicStageError("only 720p is available; 1080p or better is required")
+    ) is False
+    assert database.get_task(task_id)["retry_count"] == 0
+
+
+def test_publishing_is_never_retried_on_its_own(monkeypatch, tmp_path):
+    """Re-publishing uploads the file again and can duplicate a submission."""
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=doubleupl1", task_id="doubleupl1")
+    database.update_task(task_id, status="running", current_stage="publish")
+    runner = PipelineRunner(task_id)
+    assert runner._schedule_auto_retry(
+        "publish", RuntimeError("timed out waiting for the submission result")
+    ) is False
+
+
+def test_the_network_retry_backs_off_and_eventually_gives_up(monkeypatch, tmp_path):
+    """Retries must stay bounded, and the delay must grow.
+
+    An overnight outage should be ridden out; a permanently broken video must
+    end up failed with the reason rather than looping until the heat death of
+    the queue.
+    """
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=deadproxy1", task_id="deadproxy1")
+    database.update_task(task_id, status="running", current_stage="download")
+    database.update_stage(task_id, "download", status="running")
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline.worker, "enqueue_later", lambda tid, delay: delays.append(delay))
+    monkeypatch.setattr(pipeline, "NETWORK_RETRY_LIMIT", 3)
+
+    runner = PipelineRunner(task_id)
+    error = RuntimeError("the network could not reach the source")
+    for _ in range(3):
+        assert runner._schedule_auto_retry("download", error) is True
+
+    assert delays == [300, 600, 900]
+    assert runner._schedule_auto_retry("download", error) is False
+
+
+def test_a_bot_check_is_retried_slower_and_fewer_times(monkeypatch, tmp_path):
+    """YouTube's bot check is about the exit IP, not the cookie.
+
+    The same cookie downloaded the video fine minutes after three tasks were
+    refused, so treating "sign in to confirm you're not a bot" as a dead cookie
+    kills videos that would have gone through. It gets its own budget: later,
+    and fewer tries, because a genuinely expired cookie needs the operator.
+    """
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=botcheck1", task_id="botcheck1")
+    database.update_task(task_id, status="running", current_stage="download")
+    database.update_stage(task_id, "download", status="running")
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline.worker, "enqueue_later", lambda tid, delay: delays.append(delay))
+
+    runner = PipelineRunner(task_id)
+    error = DeterministicStageError(
+        "the video download failed: the source asked for a signed-in account (its bot check), "
+        "so the cookie is missing or expired"
+    )
+    assert runner._schedule_auto_retry("download", error) is True
+    assert delays == [900]
+    assert "blocking this machine" in database.get_task(task_id)["error_message"]
+
+    for _ in range(pipeline.BOT_CHECK_RETRY_LIMIT - 1):
+        assert runner._schedule_auto_retry("download", error) is True
+    assert runner._schedule_auto_retry("download", error) is False
+    assert len(delays) == pipeline.BOT_CHECK_RETRY_LIMIT

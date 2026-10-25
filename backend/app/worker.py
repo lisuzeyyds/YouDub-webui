@@ -21,6 +21,28 @@ def enqueue(task_id: str) -> None:
     _queue.put(task_id)
 
 
+def _enqueue_delayed(task_id: str) -> None:
+    # The queue is the tie-breaker: if the task was paused, cancelled or
+    # finished in the meantime, its status is no longer "queued" and the timer
+    # must not resurrect it.
+    try:
+        task = database.get_task(task_id)
+    except Exception:
+        logger.exception("Failed to check task %s before a delayed enqueue", task_id)
+        return
+    if task is None or task["status"] != "queued":
+        logger.info("Skipping delayed enqueue for %s (status %s)", task_id, task and task["status"])
+        return
+    _queue.put(task_id)
+
+
+def enqueue_later(task_id: str, delay_seconds: float) -> None:
+    """Queue a task after a delay, to retry a failure that may clear by itself."""
+    timer = threading.Timer(max(0.0, delay_seconds), _enqueue_delayed, args=(task_id,))
+    timer.daemon = True
+    timer.start()
+
+
 def _append_failure_log(task_id: str, traceback_text: str) -> None:
     path = database.log_path(task_id)
     timestamp = database.now_iso()

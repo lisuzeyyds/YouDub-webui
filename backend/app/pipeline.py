@@ -22,6 +22,7 @@ from . import (
     memory_guard,
     runtime_security,
     stage_reset,
+    worker,
     worker_selfheal,
 )
 from .config import WORKFOLDER
@@ -51,6 +52,83 @@ def _stage_retry_delay() -> int:
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
     return 20
+
+
+# A dead proxy, YouTube being unreachable, a relay dropping the connection: the
+# one class of failure that routinely clears by itself, and the one that costs
+# nothing to re-attempt because the check fails in seconds. Retries back off
+# from 5 minutes to half an hour and stop after NETWORK_RETRY_LIMIT of them, so
+# a machine left with the proxy off overnight picks its queue back up when it
+# comes back - but a task that keeps failing stops and says so.
+NETWORK_RETRY_LIMIT = int(os.getenv("YOUDUB_NETWORK_RETRY_LIMIT", "").strip() or 12)
+# YouTube's "sign in to confirm you're not a bot" is not a stale cookie: it is
+# the exit IP being flagged for a moment, and the same cookie downloads fine
+# minutes later. Fewer attempts, further apart - if it is really the cookie, the
+# operator has to act anyway.
+BOT_CHECK_RETRY_LIMIT = int(os.getenv("YOUDUB_BOT_RETRY_LIMIT", "").strip() or 4)
+# Re-publishing uploads the whole file again and may duplicate a submission that
+# actually went through, so only these stages come back on their own.
+NETWORK_RETRY_STAGES = {"download", "translate"}
+_RESTART_MESSAGE = "Backend restarted before the task completed."
+_NETWORK_MARKERS = (
+    "network",
+    "connection",
+    "connect",
+    "timeout",
+    "timed out",
+    "proxy",
+    "could not reach",
+    "temporary failure",
+    "name or service not known",
+    "getaddrinfo",
+    "ssl",
+    "reset by peer",
+    "unreachable",
+)
+_BOT_MARKERS = (
+    "not a bot",
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "confirm you\u2019re not a bot",
+    "bot check",
+    "signed-in account",
+)
+
+
+def _network_retry_delay(attempt: int) -> int:
+    """Seconds before the given retry (1-based): 5, 10, 15 ... capped at 30 min."""
+    return min(300 * max(1, attempt), 1800)
+
+
+def _bot_retry_delay(attempt: int) -> int:
+    """Bot checks clear on their own, but not in five minutes: 15, 30, 30 ..."""
+    return min(900 * max(1, attempt), 1800)
+
+
+def _retry_category(stage: str | None, exc: BaseException) -> str | None:
+    """Classify a failure as ``"network"``, ``"bot_check"`` or not retryable.
+
+    Both categories are the source refusing this machine rather than anything
+    about the video, and both clear by themselves. Everything else - a missing
+    file, no 1080p version, a rejected API key - stays a hard failure so the
+    task says what is actually wrong instead of looping.
+    """
+    if stage not in NETWORK_RETRY_STAGES:
+        return None
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(marker in text for marker in _BOT_MARKERS):
+        return "bot_check"
+    if isinstance(exc, DeterministicStageError):
+        return None
+    try:  # imported lazily: adapters pull in the OpenAI client at module level
+        from .adapters.openai_translate import TransientApiError
+    except Exception:  # noqa: BLE001 - the marker check below still works
+        TransientApiError = ()  # type: ignore[assignment]
+    if TransientApiError and isinstance(exc, TransientApiError):
+        return "network"
+    if _RESTART_MESSAGE.lower() in text:
+        return "network"
+    return "network" if any(marker in text for marker in _NETWORK_MARKERS) else None
 
 
 def _is_transient_stage_error(exc: BaseException) -> bool:
@@ -215,12 +293,15 @@ class PipelineRunner:
                 current_stage="done",
                 final_video_path=str(_require(self.artifacts.final_video, "final_video")),
                 completed_at=database.now_iso(),
+                retry_count=0,
             )
             self.log("Task succeeded")
         except Exception as exc:
             failure_traceback = traceback.format_exc()
             current = database.get_task(self.task_id)
             failed_stage = current["current_stage"] if current else None
+            if self._schedule_auto_retry(failed_stage, exc):
+                return
             if failed_stage and failed_stage != "done":
                 database.update_stage(
                     self.task_id,
@@ -245,6 +326,34 @@ class PipelineRunner:
         finally:
             app_logger.removeHandler(handler)
             handler.close()
+
+    def _schedule_auto_retry(self, failed_stage: str | None, exc: Exception) -> bool:
+        """Put the task back in the queue when the source, not the video, failed.
+
+        Returns True when the failure was taken over by the retry, so the caller
+        leaves the task ``queued`` instead of marking it failed.
+        """
+        category = _retry_category(failed_stage, exc)
+        if category is None:
+            return False
+        attempt = database.bump_task_retry(self.task_id)
+        limit = BOT_CHECK_RETRY_LIMIT if category == "bot_check" else NETWORK_RETRY_LIMIT
+        if attempt > limit:
+            self.log(
+                f"[{failed_stage}] gave up after {limit} automatic retries "
+                f"({category}): {exc}"
+            )
+            return False
+        delay = _bot_retry_delay(attempt) if category == "bot_check" else _network_retry_delay(attempt)
+        reason = "the source is blocking this machine" if category == "bot_check" else "network problem"
+        note = (
+            f"{reason} at [{failed_stage}] - retrying automatically in "
+            f"{delay // 60} min (attempt {attempt}/{limit}): {exc}"
+        )
+        database.requeue_for_retry(self.task_id, note)
+        worker.enqueue_later(self.task_id, delay)
+        self.log(note)
+        return True
 
     def _self_heal_if_ffmpeg_broken(self, failed_stage: str | None, exc: Exception) -> None:
         """Restart the worker when it can no longer start ffmpeg at all.
