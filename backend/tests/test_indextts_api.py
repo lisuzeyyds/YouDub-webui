@@ -28,13 +28,8 @@ def _write_translation(path: Path, items: list[dict]) -> Path:
     return path
 
 
-@pytest.fixture(autouse=True)
-def _voices_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("INDEXTTS_VOICES_DIR", str(tmp_path / "voices"))
-
-
-@patch.object(indextts_mod, "_request_json")
-def test_original_segments_reuse_source_audio(mock_request, tmp_path):
+@patch.object(indextts_mod, "_synthesize")
+def test_original_segments_reuse_source_audio(mock_synthesize, tmp_path):
     session = tmp_path / "session"
     vocals_dir = session / "segments" / "vocals"
     _make_wav(vocals_dir / "0001.wav", duration_ms=1200)
@@ -50,7 +45,7 @@ def test_original_segments_reuse_source_audio(mock_request, tmp_path):
         ],
     )
 
-    mock_request.return_value = b"RIFFfake"
+    mock_synthesize.return_value = b"RIFFfake"
 
     indextts_mod.generate_tts(
         translation,
@@ -60,9 +55,9 @@ def test_original_segments_reuse_source_audio(mock_request, tmp_path):
     )
 
     tts_dir = session / "segments" / "tts"
-    assert mock_request.call_count == 2
-    assert mock_request.call_args_list[0].args[1]["text"] == "第一段。"
-    assert mock_request.call_args_list[1].args[1]["text"] == "第三段。"
+    assert mock_synthesize.call_count == 2
+    assert mock_synthesize.call_args_list[0].args[0] == "第一段。"
+    assert mock_synthesize.call_args_list[1].args[0] == "第三段。"
     assert (tts_dir / "0001.wav").read_bytes() == b"RIFFfake"
     assert (tts_dir / "0003.wav").read_bytes() == b"RIFFfake"
 
@@ -90,8 +85,8 @@ def test_original_segments_require_original_vocals_file(tmp_path):
         indextts_mod.generate_tts(translation, vocals_dir, session)
 
 
-@patch.object(indextts_mod, "_request_json")
-def test_empty_target_text_reports_segment_index(mock_request, tmp_path):
+@patch.object(indextts_mod, "_synthesize")
+def test_empty_target_text_reports_segment_index(mock_synthesize, tmp_path):
     session = tmp_path / "session"
     vocals_dir = session / "segments" / "vocals"
     _make_wav(vocals_dir / "0001.wav", duration_ms=1200)
@@ -103,7 +98,7 @@ def test_empty_target_text_reports_segment_index(mock_request, tmp_path):
     with pytest.raises(indextts_mod.IndexTTSApiError, match="第 1 段"):
         indextts_mod.generate_tts(translation, vocals_dir, session)
 
-    mock_request.assert_not_called()
+    mock_synthesize.assert_not_called()
 
 
 def test_fallback_reference_skips_original_segments(tmp_path):
@@ -113,3 +108,42 @@ def test_fallback_reference_skips_original_segments(tmp_path):
 
     assert indextts_mod._longest_reference(vocals_dir) == long_nonverbal
     assert indextts_mod._longest_reference(vocals_dir, exclude={1}) == short_speech
+
+
+def test_build_multipart_uploads_the_reference_as_a_file(tmp_path):
+    reference = _make_wav(tmp_path / "ref.wav", duration_ms=1200)
+    text = "你好"
+    body, content_type = indextts_mod._build_multipart(
+        text, reference, [("emo_mode", "0"), ("use_random", "false")]
+    )
+
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = content_type.split("boundary=", 1)[1]
+    raw = body.decode("utf-8", errors="replace")
+    # the text field is the first form field, then the extras, then the file
+    assert 'name="text"' in raw
+    assert "你好" in raw
+    assert 'name="spk_audio"' in raw
+    assert 'filename="ref.wav"' in raw
+    # the file bytes are appended verbatim (the body ends with the closing boundary)
+    assert body.endswith(f"--{boundary}--\r\n".encode("utf-8"))
+
+
+def test_read_sse_returns_the_terminal_event():
+    stream = (
+        b'data: {"type": "progress", "value": 0.1}\n\n'
+        b'data: {"type": "done", "wav": "/api/v1/audio/x.wav", "elapsed": 3.7}\n\n'
+    )
+    assert indextts_mod._read_sse(stream)["type"] == "done"
+
+
+def test_read_sse_prefers_an_error_event():
+    stream = (
+        b'data: {"type": "progress", "value": 0.5}\n\n'
+        b'data: {"type": "error", "detail": "boom"}\n\n'
+    )
+    assert indextts_mod._read_sse(stream) == {"type": "error", "detail": "boom"}
+
+
+def test_read_sse_returns_nothing_without_a_terminal_event():
+    assert indextts_mod._read_sse(b'data: {"type": "progress"}\n\n') == {}

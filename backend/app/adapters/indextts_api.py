@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,54 +19,12 @@ class IndexTTSApiError(RuntimeError):
 
 
 def _api_url() -> str:
-    return (os.getenv("INDEXTTS_API_URL") or "http://127.0.0.1:9005").rstrip("/")
+    """Base URL of the IndexTTS2 v3 service (``http://127.0.0.1:7860``)."""
+    return (os.getenv("INDEXTTS_API_URL") or "http://127.0.0.1:7860").rstrip("/")
 
 
-def _voices_dir() -> Path:
-    value = (os.getenv("INDEXTTS_VOICES_DIR") or "").strip()
-    if not value:
-        raise IndexTTSApiError(
-            "已启用 IndexTTS API，但未配置 INDEXTTS_VOICES_DIR。"
-            "请填写 IndexTTS 服务实际使用的 voices 文件夹路径。"
-        )
-    path = Path(value).expanduser().resolve()
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _request_json(path: str, payload: dict) -> bytes:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        f"{_api_url()}/{path.lstrip('/')}",
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "audio/wav, application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=float(os.getenv("INDEXTTS_API_TIMEOUT", "600"))) as response:
-            content_type = response.headers.get("Content-Type", "")
-            result = response.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:1000]
-        raise IndexTTSApiError(f"IndexTTS API 返回 HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise IndexTTSApiError(f"无法连接 IndexTTS API {_api_url()}: {exc.reason}") from exc
-
-    if "application/json" in content_type or result[:1] == b"{":
-        try:
-            data = json.loads(result.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise IndexTTSApiError("IndexTTS API 返回了无法解析的 JSON。") from exc
-        if not data.get("ok", True):
-            raise IndexTTSApiError(str(data.get("error") or data))
-        output_path = data.get("path")
-        if not output_path:
-            raise IndexTTSApiError("IndexTTS API JSON 没有返回 path。")
-        try:
-            return Path(output_path).read_bytes()
-        except OSError as exc:
-            raise IndexTTSApiError(f"IndexTTS API 返回的音频文件无法读取: {output_path}") from exc
-    return result
+def _timeout() -> float:
+    return float(os.getenv("INDEXTTS_API_TIMEOUT", "600"))
 
 
 def _longest_reference(vocals_dir: Path, exclude: set[int] | None = None) -> Path:
@@ -89,15 +46,6 @@ def _pick_reference(vocals_dir: Path, index: int, fallback: Path) -> Path:
     return fallback
 
 
-def _copy_reference(reference: Path, voices_dir: Path) -> str:
-    configured_name = (os.getenv("INDEXTTS_REFERENCE_NAME") or "").strip()
-    filename = configured_name or f"youdub_reference_{reference.stem}{reference.suffix}"
-    target = voices_dir / Path(filename).name
-    if target.resolve() != reference.resolve():
-        shutil.copy2(reference, target)
-    return target.name
-
-
 def _text(item: dict, index: int) -> str:
     value = target_text(item)
     if not isinstance(value, str) or not value.strip():
@@ -108,44 +56,125 @@ def _text(item: dict, index: int) -> str:
     return " ".join(value.replace("\n", " ").split())
 
 
-def _optional_payload() -> dict:
-    payload: dict = {
-        "speaker": os.getenv("INDEXTTS_SPEAKER", "default"),
-        "lang": os.getenv("INDEXTTS_LANG", "ZH"),
-        "return_type": "file",
-    }
+def _optional_form() -> list[tuple[str, str]]:
+    """Extra multipart fields from the environment, mirroring the v3 API defaults."""
+    fields: list[tuple[str, str]] = [
+        ("emo_mode", os.getenv("INDEXTTS_EMO_MODE", "0")),
+        ("use_random", os.getenv("INDEXTTS_USE_RANDOM", "false")),
+    ]
     mappings = {
-        "duration_factor": ("INDEXTTS_DURATION_FACTOR", float),
-        "diffusion_steps": ("INDEXTTS_DIFFUSION_STEPS", int),
-        "segment_pause_ms": ("INDEXTTS_SEGMENT_PAUSE_MS", int),
-        "fade_out_ms": ("INDEXTTS_FADE_OUT_MS", int),
-        "max_text_tokens_per_segment": ("INDEXTTS_MAX_TEXT_TOKENS", int),
-        "emo_control_method": ("INDEXTTS_EMO_CONTROL_METHOD", int),
-        "emo_weight": ("INDEXTTS_EMO_WEIGHT", float),
-        "do_sample": ("INDEXTTS_DO_SAMPLE", lambda value: value.lower() == "true"),
-        "top_p": ("INDEXTTS_TOP_P", float),
-        "top_k": ("INDEXTTS_TOP_K", int),
-        "temperature": ("INDEXTTS_TEMPERATURE", float),
-        "length_penalty": ("INDEXTTS_LENGTH_PENALTY", float),
-        "num_beams": ("INDEXTTS_NUM_BEAMS", int),
-        "repetition_penalty": ("INDEXTTS_REPETITION_PENALTY", float),
-        "max_mel_tokens": ("INDEXTTS_MAX_MEL_TOKENS", int),
+        "emo_weight": ("INDEXTTS_EMO_WEIGHT",),
+        "max_text_tokens_per_segment": ("INDEXTTS_MAX_TEXT_TOKENS",),
+        "do_sample": ("INDEXTTS_DO_SAMPLE",),
+        "top_p": ("INDEXTTS_TOP_P",),
+        "top_k": ("INDEXTTS_TOP_K",),
+        "temperature": ("INDEXTTS_TEMPERATURE",),
+        "length_penalty": ("INDEXTTS_LENGTH_PENALTY",),
+        "num_beams": ("INDEXTTS_NUM_BEAMS",),
+        "repetition_penalty": ("INDEXTTS_REPETITION_PENALTY",),
+        "max_mel_tokens": ("INDEXTTS_MAX_MEL_TOKENS",),
+        "interval_silence": ("INDEXTTS_SEGMENT_PAUSE_MS",),
     }
-    for field, (name, converter) in mappings.items():
+    for field, (name,) in mappings.items():
         raw = os.getenv(name)
         if raw is not None and raw.strip():
-            payload[field] = converter(raw.strip())
-    fp16 = os.getenv("INDEXTTS_FP16")
-    if fp16 is not None and fp16.strip():
-        payload["fp16"] = fp16.strip().lower() == "true"
-    for field, name in (("emo_ref_audio", "INDEXTTS_EMO_REF_AUDIO"), ("emo_text", "INDEXTTS_EMO_TEXT")):
-        value = os.getenv(name, "").strip()
-        if value:
-            payload[field] = value
-    vector = os.getenv("INDEXTTS_EMO_VECTOR", "").strip()
-    if vector:
-        payload["emo_vector"] = [float(value.strip()) for value in vector.split(",")]
-    return payload
+            fields.append((field, raw.strip()))
+    emo_text = os.getenv("INDEXTTS_EMO_TEXT", "").strip()
+    if emo_text:
+        fields.extend([("emo_mode", "3"), ("emo_text", emo_text)])
+    return fields
+
+
+def _build_multipart(
+    text: str,
+    reference: Path,
+    fields: list[tuple[str, str]],
+) -> tuple[bytes, str]:
+    """Encode a multipart/form-data body with ``text``, ``spk_audio`` and extras.
+
+    Built by hand so the reference audio is uploaded as a file part (the v3
+    service requires the binary, not a filename) and so tests can stub the
+    network without a real socket. Returns ``(body, content_type)``.
+    """
+    boundary = "----youdubindexttsv3boundary"
+    lines: list[bytes] = []
+    for name, value in [("text", text), *fields]:
+        lines.append(f"--{boundary}\r\n".encode("utf-8"))
+        lines.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        lines.append(value.encode("utf-8"))
+        lines.append(b"\r\n")
+    lines.append(f"--{boundary}\r\n".encode("utf-8"))
+    lines.append(
+        f'Content-Disposition: form-data; name="spk_audio"; filename="{reference.name}"\r\n'.encode("utf-8")
+    )
+    lines.append(b"Content-Type: audio/wav\r\n\r\n")
+    lines.append(reference.read_bytes())
+    lines.append(b"\r\n")
+    lines.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(lines)
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def _read_sse(body: bytes) -> dict:
+    """Pull the first terminal event (``done`` / ``error``) out of an SSE stream."""
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            event = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if event.get("type") in {"done", "error", "stopped"}:
+            return event
+    return {}
+
+
+def _synthesize(text: str, reference: Path, fields: list[tuple[str, str]]) -> bytes:
+    """POST /api/v1/tts, follow the SSE stream, and return the wav bytes.
+
+    The v3 service streams progress events and ends with a ``done`` event whose
+    ``wav`` field is a relative path (``/api/v1/audio/...``). The audio is then
+    fetched in a second request. Any ``error`` event fails with its ``detail``.
+    """
+    body, content_type = _build_multipart(text, reference, fields)
+    request = urllib.request.Request(
+        f"{_api_url()}/api/v1/tts",
+        data=body,
+        headers={"Content-Type": content_type, "Accept": "text/event-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_timeout()) as response:
+            stream = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:1000]
+        raise IndexTTSApiError(f"IndexTTS API 返回 HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise IndexTTSApiError(f"无法连接 IndexTTS API {_api_url()}: {exc.reason}") from exc
+
+    event = _read_sse(stream)
+    if event.get("type") == "error":
+        raise IndexTTSApiError(f"IndexTTS 合成失败: {event.get('detail') or event}")
+    wav_path = event.get("wav")
+    if not wav_path:
+        raise IndexTTSApiError("IndexTTS 流没有返回 wav 路径。")
+
+    wav_url = wav_path if wav_path.startswith("http") else f"{_api_url()}{wav_path}"
+    # The filename may contain Chinese, which urllib refuses to send un-encoded.
+    scheme, netloc, path, query, fragment = urllib.parse.urlsplit(wav_url)
+    path = urllib.parse.quote(path)
+    wav_url = urllib.parse.urlunsplit((scheme, netloc, path, query, fragment))
+    try:
+        with urllib.request.urlopen(wav_url, timeout=_timeout()) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise IndexTTSApiError(f"下载 IndexTTS 音频失败 HTTP {exc.code}: {wav_path}") from exc
+    except urllib.error.URLError as exc:
+        raise IndexTTSApiError(f"下载 IndexTTS 音频失败 {wav_path}: {exc.reason}") from exc
 
 
 def generate_tts(
@@ -173,8 +202,7 @@ def generate_tts(
     original_indices = {
         index for index, item in enumerate(items, start=1) if is_original_audio(item)
     }
-    voices_dir = _voices_dir()
-    base_payload = _optional_payload()
+    fields = _optional_form()
     fallback_reference: Path | None = None
 
     for index, item in enumerate(items, start=1):
@@ -189,13 +217,7 @@ def generate_tts(
             if fallback_reference is None:
                 fallback_reference = _longest_reference(vocals_dir, exclude=original_indices)
             reference = _pick_reference(vocals_dir, index, fallback_reference)
-            reference_name = _copy_reference(reference, voices_dir)
-            payload = {
-                **base_payload,
-                "audio": reference_name,
-                "text": _text(item, index),
-            }
-            output_file.write_bytes(_request_json("tts", payload))
+            output_file.write_bytes(_synthesize(_text(item, index), reference, fields))
         if progress_callback:
             progress_callback(
                 round(index / len(items) * 100),
